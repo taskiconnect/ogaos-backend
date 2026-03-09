@@ -7,7 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"ogaos-backend/internal/service/auth" // ← your service package
+	"ogaos-backend/internal/service/auth"
 )
 
 // Handler is the HTTP handler layer for authentication endpoints
@@ -72,6 +72,36 @@ func (h *Handler) VerifyEmail(c *gin.Context) {
 	})
 }
 
+// ResendVerification sends a new verification email to an unverified account.
+// POST /api/v1/auth/resend-verification
+// Body: { "email": "user@example.com" }
+func (h *Handler) ResendVerification(c *gin.Context) {
+	var req struct {
+		Email string `json:"email" binding:"required,email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	if err := h.service.ResendVerification(req.Email); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	// Always return the same message — don't leak whether the email exists
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "If that email is registered and unverified, a new verification link has been sent.",
+	})
+}
+
 // Login authenticates a user (owner, staff or platform admin)
 func (h *Handler) Login(c *gin.Context) {
 	var req struct {
@@ -96,15 +126,14 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	// Set HttpOnly + Secure cookie for refresh token
 	c.SetCookie(
 		"refresh_token",
 		refreshToken,
-		3600*24*7, // 7 days
+		3600*24*7,
 		"/",
 		"",
-		true, // Secure (change to true in production with HTTPS)
-		true, // HttpOnly
+		true,
+		true,
 	)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -158,7 +187,6 @@ func (h *Handler) Logout(c *gin.Context) {
 		_ = h.service.Logout(refreshToken)
 	}
 
-	// Clear the cookie
 	c.SetCookie("refresh_token", "", -1, "/", "", true, true)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -167,10 +195,7 @@ func (h *Handler) Logout(c *gin.Context) {
 	})
 }
 
-// ────────────────────────────────────────────────
-// WhoAmI – returns the authenticated user's profile
-// ────────────────────────────────────────────────
-
+// WhoAmI returns the authenticated user's profile
 func (h *Handler) WhoAmI(c *gin.Context) {
 	userIDVal, exists := c.Get("user_id")
 	if !exists {

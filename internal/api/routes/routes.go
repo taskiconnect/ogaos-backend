@@ -65,6 +65,7 @@ func SetupAuthRoutes(
 		authGroup.POST("/refresh", authHandler.Refresh)
 		authGroup.POST("/logout", authHandler.Logout)
 		authGroup.GET("/verify", authHandler.VerifyEmail)
+		authGroup.POST("/resend-verification", authHandler.ResendVerification)
 	}
 
 	// ── Location (public — needed at signup before account exists) ────────────
