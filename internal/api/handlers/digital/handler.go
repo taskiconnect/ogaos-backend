@@ -38,13 +38,13 @@ func (h *Handler) Create(c *gin.Context) {
 
 // GET /digital-products
 func (h *Handler) List(c *gin.Context) {
-	page, limit := shared.Paginate(c)
-	products, total, err := h.service.List(shared.MustBusinessID(c), page, limit)
+	cur, limit := shared.CursorParams(c)
+	products, nextCursor, err := h.service.List(shared.MustBusinessID(c), cur, limit)
 	if err != nil {
 		response.InternalError(c, err.Error())
 		return
 	}
-	response.List(c, products, total, page, limit)
+	response.CursorList(c, products, nextCursor)
 }
 
 // GET /digital-products/:id
@@ -93,7 +93,7 @@ func (h *Handler) Delete(c *gin.Context) {
 	response.Message(c, "product deleted")
 }
 
-// POST /digital-products/:id/file  — multipart, field: "file"
+// POST /digital-products/:id/file
 func (h *Handler) UploadFile(c *gin.Context) {
 	id, ok := shared.ParseID(c, "id")
 	if !ok {
@@ -123,7 +123,7 @@ func (h *Handler) UploadFile(c *gin.Context) {
 	response.Message(c, "file uploaded successfully")
 }
 
-// POST /digital-products/:id/cover  — multipart, field: "cover"
+// POST /digital-products/:id/cover
 func (h *Handler) UploadCover(c *gin.Context) {
 	id, ok := shared.ParseID(c, "id")
 	if !ok {
@@ -151,8 +151,6 @@ func (h *Handler) UploadCover(c *gin.Context) {
 	}
 	response.OK(c, gin.H{"cover_image_url": result.URL})
 }
-
-// ─── Public storefront ────────────────────────────────────────────────────────
 
 // GET /public/store/:slug
 func (h *Handler) GetPublicProduct(c *gin.Context) {
@@ -186,7 +184,7 @@ func (h *Handler) Purchase(c *gin.Context) {
 	})
 }
 
-// GET /public/orders/:order_id/download?email=buyer@example.com
+// GET /public/orders/:order_id/download
 func (h *Handler) GetDownload(c *gin.Context) {
 	orderID, ok := shared.ParseID(c, "order_id")
 	if !ok {

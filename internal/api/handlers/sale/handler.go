@@ -30,21 +30,21 @@ func (h *Handler) Create(c *gin.Context) {
 
 // GET /sales
 func (h *Handler) List(c *gin.Context) {
-	page, limit := shared.Paginate(c)
-	sales, total, err := h.service.List(shared.MustBusinessID(c), svcSale.ListFilter{
+	cur, limit := shared.CursorParams(c)
+	sales, nextCursor, err := h.service.List(shared.MustBusinessID(c), svcSale.ListFilter{
 		StoreID:    shared.QueryUUID(c, "store_id"),
 		CustomerID: shared.QueryUUID(c, "customer_id"),
 		Status:     c.Query("status"),
 		DateFrom:   shared.QueryTime(c, "date_from"),
 		DateTo:     shared.QueryTime(c, "date_to"),
-		Page:       page,
+		Cursor:     cur,
 		Limit:      limit,
 	})
 	if err != nil {
 		response.InternalError(c, err.Error())
 		return
 	}
-	response.List(c, sales, total, page, limit)
+	response.CursorList(c, sales, nextCursor)
 }
 
 // GET /sales/:id

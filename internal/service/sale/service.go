@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"ogaos-backend/internal/domain/models"
+	"ogaos-backend/internal/pkg/cursor"
 )
 
 type Service struct {
@@ -55,22 +56,18 @@ type ListFilter struct {
 	Status     string
 	DateFrom   *time.Time
 	DateTo     *time.Time
-	Page       int
+	Cursor     string
 	Limit      int
 }
 
 // ─── Methods ─────────────────────────────────────────────────────────────────
 
-// Create records a new completed sale with line items.
-// Deducts stock for tracked inventory products.
-// Creates a ledger entry for the revenue.
 func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*models.Sale, error) {
 	saleNumber, err := s.nextSaleNumber(businessID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build sale items and compute subtotal
 	var items []models.SaleItem
 	var subTotal int64
 	for _, item := range req.Items {
@@ -111,16 +108,12 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 		if err := tx.Create(&sale).Error; err != nil {
 			return err
 		}
-
-		// Assign sale ID to items and save
 		for i := range items {
 			items[i].SaleID = sale.ID
 		}
 		if err := tx.Create(&items).Error; err != nil {
 			return err
 		}
-
-		// Deduct stock for tracked products
 		for _, item := range req.Items {
 			if item.ProductID != nil {
 				tx.Model(&models.Product{}).
@@ -128,23 +121,19 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 					UpdateColumn("stock_quantity", gorm.Expr("stock_quantity - ?", item.Quantity))
 			}
 		}
-
-		// Update customer stats
 		if req.CustomerID != nil {
 			tx.Model(&models.Customer{}).Where("id = ?", *req.CustomerID).Updates(map[string]interface{}{
 				"total_purchases": gorm.Expr("total_purchases + ?", sale.TotalAmount),
 				"total_orders":    gorm.Expr("total_orders + 1"),
 			})
 		}
-
-		// Ledger entry — revenue
 		ledger := models.LedgerEntry{
 			BusinessID:  businessID,
 			Type:        models.LedgerCredit,
 			SourceType:  models.LedgerSourceSale,
 			SourceID:    sale.ID,
 			Amount:      sale.TotalAmount,
-			Balance:     0, // running balance computed by ledger query
+			Balance:     0,
 			Description: "Sale " + saleNumber,
 			RecordedBy:  recordedBy,
 		}
@@ -170,14 +159,10 @@ func (s *Service) Get(businessID, saleID uuid.UUID) (*models.Sale, error) {
 	return &sale, nil
 }
 
-func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Sale, int64, error) {
-	if filter.Page < 1 {
-		filter.Page = 1
-	}
+func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Sale, string, error) {
 	if filter.Limit < 1 || filter.Limit > 100 {
 		filter.Limit = 20
 	}
-	offset := (filter.Page - 1) * filter.Limit
 
 	q := s.db.Model(&models.Sale{}).Where("business_id = ?", businessID)
 	if filter.StoreID != nil {
@@ -196,23 +181,35 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Sale, 
 		q = q.Where("created_at <= ?", *filter.DateTo)
 	}
 
-	var total int64
-	q.Count(&total)
+	if filter.Cursor != "" {
+		cur, id, err := cursor.Decode(filter.Cursor)
+		if err != nil {
+			return nil, "", errors.New("invalid cursor")
+		}
+		q = q.Where("(created_at, id) < (?, ?)", cur, id)
+	}
 
 	var sales []models.Sale
-	err := q.Preload("Customer").Offset(offset).Limit(filter.Limit).Order("created_at DESC").Find(&sales).Error
-	return sales, total, err
+	if err := q.Preload("Customer").Order("created_at DESC, id DESC").Limit(filter.Limit + 1).Find(&sales).Error; err != nil {
+		return nil, "", err
+	}
+
+	var nextCursor string
+	if len(sales) > filter.Limit {
+		last := sales[filter.Limit-1]
+		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
+		sales = sales[:filter.Limit]
+	}
+	return sales, nextCursor, nil
 }
 
-// GenerateReceipt assigns a receipt number to a completed sale.
-// Idempotent — safe to call multiple times.
 func (s *Service) GenerateReceipt(businessID, saleID uuid.UUID) (*models.Sale, error) {
 	var sale models.Sale
 	if err := s.db.Where("id = ? AND business_id = ?", saleID, businessID).First(&sale).Error; err != nil {
 		return nil, errors.New("sale not found")
 	}
 	if sale.ReceiptNumber != nil {
-		return &sale, nil // already has receipt number
+		return &sale, nil
 	}
 
 	receiptNumber, err := s.nextReceiptNumber(businessID)
@@ -230,14 +227,11 @@ func (s *Service) GenerateReceipt(businessID, saleID uuid.UUID) (*models.Sale, e
 	return &sale, nil
 }
 
-// ─── Number generation ────────────────────────────────────────────────────────
-
 func (s *Service) nextSaleNumber(businessID uuid.UUID) (string, error) {
 	prefix := fmt.Sprintf("SL-%s-", time.Now().Format("200601"))
 	var last models.Sale
 	err := s.db.Where("business_id = ? AND sale_number LIKE ?", businessID, prefix+"%").
 		Order("sale_number DESC").First(&last).Error
-
 	seq := 1
 	if err == nil {
 		fmt.Sscanf(last.SaleNumber[len(prefix):], "%d", &seq)
@@ -251,7 +245,6 @@ func (s *Service) nextReceiptNumber(businessID uuid.UUID) (string, error) {
 	var last models.Sale
 	err := s.db.Where("business_id = ? AND receipt_number LIKE ?", businessID, prefix+"%").
 		Order("receipt_number DESC").First(&last).Error
-
 	seq := 1
 	if err == nil && last.ReceiptNumber != nil {
 		fmt.Sscanf((*last.ReceiptNumber)[len(prefix):], "%d", &seq)

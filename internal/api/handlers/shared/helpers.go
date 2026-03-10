@@ -25,7 +25,7 @@ func MustUserID(c *gin.Context) uuid.UUID {
 }
 
 // ParseID parses a URL param as uuid.UUID.
-// Writes a 400 response and returns false on failure — the handler should return immediately.
+// Writes a 400 response and returns false on failure.
 func ParseID(c *gin.Context, param string) (uuid.UUID, bool) {
 	id, err := uuid.Parse(c.Param(param))
 	if err != nil {
@@ -35,9 +35,11 @@ func ParseID(c *gin.Context, param string) (uuid.UUID, bool) {
 	return id, true
 }
 
-// Paginate returns page and limit from query params with sane defaults.
-func Paginate(c *gin.Context) (page, limit int) {
-	page = queryInt(c, "page", 1)
+// CursorParams returns the raw cursor string and limit from query params.
+// cursor is "" when absent (first page).
+// limit defaults to 20, max 100.
+func CursorParams(c *gin.Context) (cursor string, limit int) {
+	cursor = c.Query("cursor")
 	limit = queryInt(c, "limit", 20)
 	if limit > 100 {
 		limit = 100
@@ -80,8 +82,6 @@ func QueryBool(c *gin.Context, key string) bool {
 func QueryInt(c *gin.Context, key string, fallback int) int {
 	return queryInt(c, key, fallback)
 }
-
-// ─── unexported ───────────────────────────────────────────────────────────────
 
 func queryInt(c *gin.Context, key string, fallback int) int {
 	s := c.Query(key)

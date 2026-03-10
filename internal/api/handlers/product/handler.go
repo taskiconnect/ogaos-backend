@@ -38,20 +38,20 @@ func (h *Handler) Create(c *gin.Context) {
 
 // GET /products
 func (h *Handler) List(c *gin.Context) {
-	page, limit := shared.Paginate(c)
-	products, total, err := h.service.List(shared.MustBusinessID(c), svcProduct.ListFilter{
+	cur, limit := shared.CursorParams(c)
+	products, nextCursor, err := h.service.List(shared.MustBusinessID(c), svcProduct.ListFilter{
 		StoreID:  shared.QueryUUID(c, "store_id"),
 		Type:     c.Query("type"),
 		Search:   c.Query("search"),
 		LowStock: shared.QueryBool(c, "low_stock"),
-		Page:     page,
+		Cursor:   cur,
 		Limit:    limit,
 	})
 	if err != nil {
 		response.InternalError(c, err.Error())
 		return
 	}
-	response.List(c, products, total, page, limit)
+	response.CursorList(c, products, nextCursor)
 }
 
 // GET /products/:id
@@ -119,7 +119,7 @@ func (h *Handler) AdjustStock(c *gin.Context) {
 	response.OK(c, p)
 }
 
-// POST /products/:id/image  — multipart/form-data, field: "image"
+// POST /products/:id/image
 func (h *Handler) UploadImage(c *gin.Context) {
 	id, ok := shared.ParseID(c, "id")
 	if !ok {

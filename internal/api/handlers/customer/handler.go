@@ -30,17 +30,17 @@ func (h *Handler) Create(c *gin.Context) {
 
 // GET /customers
 func (h *Handler) List(c *gin.Context) {
-	page, limit := shared.Paginate(c)
-	customers, total, err := h.service.List(shared.MustBusinessID(c), svcCustomer.ListFilter{
+	cur, limit := shared.CursorParams(c)
+	customers, nextCursor, err := h.service.List(shared.MustBusinessID(c), svcCustomer.ListFilter{
 		Search: c.Query("search"),
-		Page:   page,
+		Cursor: cur,
 		Limit:  limit,
 	})
 	if err != nil {
 		response.InternalError(c, err.Error())
 		return
 	}
-	response.List(c, customers, total, page, limit)
+	response.CursorList(c, customers, nextCursor)
 }
 
 // GET /customers/:id

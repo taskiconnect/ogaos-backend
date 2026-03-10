@@ -21,8 +21,6 @@ func NewHandler(s *svcRecruitment.Service, u *svcUpload.Service) *Handler {
 	return &Handler{service: s, upload: u}
 }
 
-// ─── Job openings ─────────────────────────────────────────────────────────────
-
 // POST /jobs
 func (h *Handler) CreateJob(c *gin.Context) {
 	var req svcRecruitment.CreateJobRequest
@@ -40,18 +38,18 @@ func (h *Handler) CreateJob(c *gin.Context) {
 
 // GET /jobs
 func (h *Handler) ListJobs(c *gin.Context) {
-	page, limit := shared.Paginate(c)
-	jobs, total, err := h.service.ListJobs(shared.MustBusinessID(c), svcRecruitment.JobListFilter{
+	cur, limit := shared.CursorParams(c)
+	jobs, nextCursor, err := h.service.ListJobs(shared.MustBusinessID(c), svcRecruitment.JobListFilter{
 		Status: c.Query("status"),
 		Type:   c.Query("type"),
-		Page:   page,
+		Cursor: cur,
 		Limit:  limit,
 	})
 	if err != nil {
 		response.InternalError(c, err.Error())
 		return
 	}
-	response.List(c, jobs, total, page, limit)
+	response.CursorList(c, jobs, nextCursor)
 }
 
 // GET /jobs/:id
@@ -81,8 +79,6 @@ func (h *Handler) CloseJob(c *gin.Context) {
 	response.Message(c, "job closed")
 }
 
-// ─── Public (no auth) ─────────────────────────────────────────────────────────
-
 // GET /public/jobs/:slug
 func (h *Handler) GetPublicJob(c *gin.Context) {
 	job, err := h.service.GetPublicJob(c.Param("slug"))
@@ -93,7 +89,7 @@ func (h *Handler) GetPublicJob(c *gin.Context) {
 	response.OK(c, job)
 }
 
-// POST /public/jobs/:id/apply  — multipart/form-data
+// POST /public/jobs/:id/apply
 func (h *Handler) Apply(c *gin.Context) {
 	jobID, ok := shared.ParseID(c, "id")
 	if !ok {
@@ -133,22 +129,20 @@ func (h *Handler) Apply(c *gin.Context) {
 	})
 }
 
-// ─── Applications ─────────────────────────────────────────────────────────────
-
 // GET /applications
 func (h *Handler) ListApplications(c *gin.Context) {
-	page, limit := shared.Paginate(c)
-	apps, total, err := h.service.ListApplications(shared.MustBusinessID(c), svcRecruitment.AppListFilter{
+	cur, limit := shared.CursorParams(c)
+	apps, nextCursor, err := h.service.ListApplications(shared.MustBusinessID(c), svcRecruitment.AppListFilter{
 		JobOpeningID: shared.QueryUUID(c, "job_id"),
 		Status:       c.Query("status"),
-		Page:         page,
+		Cursor:       cur,
 		Limit:        limit,
 	})
 	if err != nil {
 		response.InternalError(c, err.Error())
 		return
 	}
-	response.List(c, apps, total, page, limit)
+	response.CursorList(c, apps, nextCursor)
 }
 
 // PATCH /applications/:id/review

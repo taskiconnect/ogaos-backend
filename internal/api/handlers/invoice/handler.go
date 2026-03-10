@@ -30,20 +30,20 @@ func (h *Handler) Create(c *gin.Context) {
 
 // GET /invoices
 func (h *Handler) List(c *gin.Context) {
-	page, limit := shared.Paginate(c)
-	invoices, total, err := h.service.List(shared.MustBusinessID(c), svcInvoice.ListFilter{
+	cur, limit := shared.CursorParams(c)
+	invoices, nextCursor, err := h.service.List(shared.MustBusinessID(c), svcInvoice.ListFilter{
 		Status:     c.Query("status"),
 		CustomerID: shared.QueryUUID(c, "customer_id"),
 		DateFrom:   shared.QueryTime(c, "date_from"),
 		DateTo:     shared.QueryTime(c, "date_to"),
-		Page:       page,
+		Cursor:     cur,
 		Limit:      limit,
 	})
 	if err != nil {
 		response.InternalError(c, err.Error())
 		return
 	}
-	response.List(c, invoices, total, page, limit)
+	response.CursorList(c, invoices, nextCursor)
 }
 
 // GET /invoices/:id
@@ -95,7 +95,7 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	response.OK(c, inv)
 }
 
-// DELETE /invoices/:id  — cancel
+// DELETE /invoices/:id
 func (h *Handler) Cancel(c *gin.Context) {
 	id, ok := shared.ParseID(c, "id")
 	if !ok {

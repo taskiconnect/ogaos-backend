@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"ogaos-backend/internal/domain/models"
+	"ogaos-backend/internal/pkg/cursor"
 	"ogaos-backend/internal/pkg/email"
 )
 
@@ -59,14 +60,14 @@ type ReviewRequest struct {
 type JobListFilter struct {
 	Status string
 	Type   string
-	Page   int
+	Cursor string
 	Limit  int
 }
 
 type AppListFilter struct {
 	JobOpeningID *uuid.UUID
 	Status       string
-	Page         int
+	Cursor       string
 	Limit        int
 }
 
@@ -124,14 +125,10 @@ func (s *Service) GetPublicJob(slug string) (*models.JobOpening, error) {
 	return &job, nil
 }
 
-func (s *Service) ListJobs(businessID uuid.UUID, filter JobListFilter) ([]models.JobOpening, int64, error) {
-	if filter.Page < 1 {
-		filter.Page = 1
-	}
+func (s *Service) ListJobs(businessID uuid.UUID, filter JobListFilter) ([]models.JobOpening, string, error) {
 	if filter.Limit < 1 || filter.Limit > 100 {
 		filter.Limit = 20
 	}
-	offset := (filter.Page - 1) * filter.Limit
 
 	q := s.db.Model(&models.JobOpening{}).Where("business_id = ?", businessID)
 	if filter.Status != "" {
@@ -141,12 +138,26 @@ func (s *Service) ListJobs(businessID uuid.UUID, filter JobListFilter) ([]models
 		q = q.Where("type = ?", filter.Type)
 	}
 
-	var total int64
-	q.Count(&total)
+	if filter.Cursor != "" {
+		cur, id, err := cursor.Decode(filter.Cursor)
+		if err != nil {
+			return nil, "", errors.New("invalid cursor")
+		}
+		q = q.Where("(created_at, id) < (?, ?)", cur, id)
+	}
 
 	var jobs []models.JobOpening
-	err := q.Offset(offset).Limit(filter.Limit).Order("created_at DESC").Find(&jobs).Error
-	return jobs, total, err
+	if err := q.Order("created_at DESC, id DESC").Limit(filter.Limit + 1).Find(&jobs).Error; err != nil {
+		return nil, "", err
+	}
+
+	var nextCursor string
+	if len(jobs) > filter.Limit {
+		last := jobs[filter.Limit-1]
+		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
+		jobs = jobs[:filter.Limit]
+	}
+	return jobs, nextCursor, nil
 }
 
 func (s *Service) CloseJob(businessID, jobID uuid.UUID) error {
@@ -161,7 +172,6 @@ func (s *Service) CloseJob(businessID, jobID uuid.UUID) error {
 
 // ─── Applications ─────────────────────────────────────────────────────────────
 
-// Apply is called by the public — no business auth.
 func (s *Service) Apply(jobID uuid.UUID, req ApplyRequest, cvURL *string) (*models.RecruitmentApplication, error) {
 	var job models.JobOpening
 	if err := s.db.First(&job, jobID).Error; err != nil {
@@ -174,7 +184,6 @@ func (s *Service) Apply(jobID uuid.UUID, req ApplyRequest, cvURL *string) (*mode
 		return nil, errors.New("the application deadline has passed")
 	}
 
-	// Duplicate check — one application per email per job
 	var count int64
 	s.db.Model(&models.RecruitmentApplication{}).
 		Where("job_opening_id = ? AND email = ?", jobID, req.Email).Count(&count)
@@ -210,14 +219,13 @@ func (s *Service) Apply(jobID uuid.UUID, req ApplyRequest, cvURL *string) (*mode
 		return nil, err
 	}
 
-	// Send assessment link if enabled
 	if job.AssessmentEnabled {
 		assessmentURL := fmt.Sprintf("%s/assessment/%s", s.frontendURL, app.ID)
 		email.SendAssessmentLink(
 			req.Email,
 			req.FirstName+" "+req.LastName,
 			job.Title,
-			"", // business name loaded separately if needed
+			"",
 			assessmentURL,
 			job.TimeLimitMinutes,
 		)
@@ -226,14 +234,10 @@ func (s *Service) Apply(jobID uuid.UUID, req ApplyRequest, cvURL *string) (*mode
 	return &app, nil
 }
 
-func (s *Service) ListApplications(businessID uuid.UUID, filter AppListFilter) ([]models.RecruitmentApplication, int64, error) {
-	if filter.Page < 1 {
-		filter.Page = 1
-	}
+func (s *Service) ListApplications(businessID uuid.UUID, filter AppListFilter) ([]models.RecruitmentApplication, string, error) {
 	if filter.Limit < 1 || filter.Limit > 100 {
 		filter.Limit = 20
 	}
-	offset := (filter.Page - 1) * filter.Limit
 
 	q := s.db.Model(&models.RecruitmentApplication{}).Where("business_id = ?", businessID)
 	if filter.JobOpeningID != nil {
@@ -243,12 +247,26 @@ func (s *Service) ListApplications(businessID uuid.UUID, filter AppListFilter) (
 		q = q.Where("status = ?", filter.Status)
 	}
 
-	var total int64
-	q.Count(&total)
+	if filter.Cursor != "" {
+		cur, id, err := cursor.Decode(filter.Cursor)
+		if err != nil {
+			return nil, "", errors.New("invalid cursor")
+		}
+		q = q.Where("(created_at, id) < (?, ?)", cur, id)
+	}
 
 	var apps []models.RecruitmentApplication
-	err := q.Offset(offset).Limit(filter.Limit).Order("created_at DESC").Find(&apps).Error
-	return apps, total, err
+	if err := q.Preload("JobOpening").Order("created_at DESC, id DESC").Limit(filter.Limit + 1).Find(&apps).Error; err != nil {
+		return nil, "", err
+	}
+
+	var nextCursor string
+	if len(apps) > filter.Limit {
+		last := apps[filter.Limit-1]
+		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
+		apps = apps[:filter.Limit]
+	}
+	return apps, nextCursor, nil
 }
 
 func (s *Service) ReviewApplication(businessID, appID uuid.UUID, req ReviewRequest) (*models.RecruitmentApplication, error) {
@@ -275,9 +293,6 @@ func (s *Service) ReviewApplication(businessID, appID uuid.UUID, req ReviewReque
 	return &app, nil
 }
 
-// ─── Assessment ───────────────────────────────────────────────────────────────
-
-// SubmitAssessment records the score and sends pass/fail email.
 func (s *Service) SubmitAssessment(appID uuid.UUID, score int) error {
 	var app models.RecruitmentApplication
 	if err := s.db.Preload("JobOpening").First(&app, appID).Error; err != nil {
@@ -299,8 +314,6 @@ func (s *Service) SubmitAssessment(appID uuid.UUID, score int) error {
 	email.SendAssessmentResult(app.Email, app.FirstName+" "+app.LastName, app.JobOpening.Title, "", passed)
 	return nil
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func (s *Service) generateJobSlug(businessID uuid.UUID, title string) string {
 	slug := strings.Map(func(r rune) rune {

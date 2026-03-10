@@ -9,6 +9,7 @@ import (
 	"gorm.io/gorm"
 
 	"ogaos-backend/internal/domain/models"
+	"ogaos-backend/internal/pkg/cursor"
 )
 
 type Service struct {
@@ -23,18 +24,17 @@ func NewService(db *gorm.DB) *Service {
 
 type CreateRequest struct {
 	StoreID         *uuid.UUID `json:"store_id"`
-	ExpenseType     string     `json:"expense_type" binding:"required"` // cogs | opex | capex | tax_payment
+	ExpenseType     string     `json:"expense_type" binding:"required"`
 	Category        string     `json:"category" binding:"required"`
 	Description     string     `json:"description" binding:"required"`
 	Amount          int64      `json:"amount" binding:"required,min=1"`
 	VATInclusive    bool       `json:"vat_inclusive"`
 	VATRate         float64    `json:"vat_rate"`
 	IsTaxDeductible bool       `json:"is_tax_deductible"`
-	// CapEx fields
-	AssetLifeYears *int       `json:"asset_life_years"`
-	AssetStartDate *time.Time `json:"asset_start_date"`
-	ReceiptURL     *string    `json:"receipt_url"`
-	ExpenseDate    *time.Time `json:"expense_date"`
+	AssetLifeYears  *int       `json:"asset_life_years"`
+	AssetStartDate  *time.Time `json:"asset_start_date"`
+	ReceiptURL      *string    `json:"receipt_url"`
+	ExpenseDate     *time.Time `json:"expense_date"`
 }
 
 type UpdateRequest struct {
@@ -53,7 +53,7 @@ type ListFilter struct {
 	Category    string
 	DateFrom    *time.Time
 	DateTo      *time.Time
-	Page        int
+	Cursor      string
 	Limit       int
 }
 
@@ -98,14 +98,13 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 		if err := tx.Create(&e).Error; err != nil {
 			return err
 		}
-		// Ledger debit entry
 		ledger := models.LedgerEntry{
 			BusinessID:  businessID,
 			Type:        models.LedgerDebit,
 			SourceType:  models.LedgerSourceExpense,
 			SourceID:    e.ID,
 			Amount:      e.Amount,
-			Balance:     0, // running balance computed by ledger query
+			Balance:     0,
 			Description: e.Description,
 			RecordedBy:  recordedBy,
 		}
@@ -121,14 +120,10 @@ func (s *Service) Get(businessID, expenseID uuid.UUID) (*models.Expense, error) 
 	return &e, nil
 }
 
-func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Expense, int64, error) {
-	if filter.Page < 1 {
-		filter.Page = 1
-	}
+func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Expense, string, error) {
 	if filter.Limit < 1 || filter.Limit > 100 {
 		filter.Limit = 20
 	}
-	offset := (filter.Page - 1) * filter.Limit
 
 	q := s.db.Model(&models.Expense{}).Where("business_id = ?", businessID)
 	if filter.StoreID != nil {
@@ -147,12 +142,26 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Expens
 		q = q.Where("expense_date <= ?", *filter.DateTo)
 	}
 
-	var total int64
-	q.Count(&total)
+	if filter.Cursor != "" {
+		cur, id, err := cursor.Decode(filter.Cursor)
+		if err != nil {
+			return nil, "", errors.New("invalid cursor")
+		}
+		q = q.Where("(created_at, id) < (?, ?)", cur, id)
+	}
 
 	var expenses []models.Expense
-	err := q.Offset(offset).Limit(filter.Limit).Order("expense_date DESC").Find(&expenses).Error
-	return expenses, total, err
+	if err := q.Order("created_at DESC, id DESC").Limit(filter.Limit + 1).Find(&expenses).Error; err != nil {
+		return nil, "", err
+	}
+
+	var nextCursor string
+	if len(expenses) > filter.Limit {
+		last := expenses[filter.Limit-1]
+		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
+		expenses = expenses[:filter.Limit]
+	}
+	return expenses, nextCursor, nil
 }
 
 func (s *Service) Update(businessID, expenseID uuid.UUID, req UpdateRequest) (*models.Expense, error) {
@@ -196,15 +205,13 @@ func (s *Service) Delete(businessID, expenseID uuid.UUID) error {
 	return result.Error
 }
 
-// MonthlySummary returns totals by expense type for a given year/month.
-// Used to populate the tax_summary service.
 type MonthlySummaryResult struct {
 	TotalCOGS         int64
 	TotalOpex         int64
 	TotalCapex        int64
 	TotalSalaries     int64
 	TotalRent         int64
-	TotalDepreciation int64 // computed from capex assets
+	TotalDepreciation int64
 	VATOnExpenses     int64
 }
 
@@ -244,7 +251,6 @@ func (s *Service) MonthlySummary(businessID uuid.UUID, year, month int) (Monthly
 		result.VATOnExpenses += r.TotalVAT
 	}
 
-	// Compute monthly depreciation from all active capex assets
 	var capexAssets []models.Expense
 	s.db.Where("business_id = ? AND expense_type = ? AND asset_life_years > 0", businessID, models.ExpenseTypeCapex).
 		Find(&capexAssets)

@@ -8,6 +8,7 @@ import (
 	"gorm.io/gorm"
 
 	"ogaos-backend/internal/domain/models"
+	"ogaos-backend/internal/pkg/cursor"
 )
 
 type Service struct {
@@ -55,7 +56,7 @@ type ListFilter struct {
 	Type     string
 	Search   string
 	LowStock bool
-	Page     int
+	Cursor   string
 	Limit    int
 }
 
@@ -96,14 +97,10 @@ func (s *Service) Get(businessID, productID uuid.UUID) (*models.Product, error) 
 	return &p, nil
 }
 
-func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Product, int64, error) {
-	if filter.Page < 1 {
-		filter.Page = 1
-	}
+func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Product, string, error) {
 	if filter.Limit < 1 || filter.Limit > 100 {
 		filter.Limit = 20
 	}
-	offset := (filter.Page - 1) * filter.Limit
 
 	q := s.db.Model(&models.Product{}).Where("business_id = ? AND is_active = true", businessID)
 	if filter.StoreID != nil {
@@ -120,14 +117,26 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Produc
 		q = q.Where("track_inventory = true AND stock_quantity <= low_stock_threshold")
 	}
 
-	var total int64
-	q.Count(&total)
+	if filter.Cursor != "" {
+		cur, id, err := cursor.Decode(filter.Cursor)
+		if err != nil {
+			return nil, "", errors.New("invalid cursor")
+		}
+		q = q.Where("(created_at, id) < (?, ?)", cur, id)
+	}
 
 	var products []models.Product
-	if err := q.Offset(offset).Limit(filter.Limit).Order("name ASC").Find(&products).Error; err != nil {
-		return nil, 0, err
+	if err := q.Order("created_at DESC, id DESC").Limit(filter.Limit + 1).Find(&products).Error; err != nil {
+		return nil, "", err
 	}
-	return products, total, nil
+
+	var nextCursor string
+	if len(products) > filter.Limit {
+		last := products[filter.Limit-1]
+		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
+		products = products[:filter.Limit]
+	}
+	return products, nextCursor, nil
 }
 
 func (s *Service) Update(businessID, productID uuid.UUID, req UpdateRequest) (*models.Product, error) {

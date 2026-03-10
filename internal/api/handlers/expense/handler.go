@@ -30,25 +30,24 @@ func (h *Handler) Create(c *gin.Context) {
 
 // GET /expenses
 func (h *Handler) List(c *gin.Context) {
-	page, limit := shared.Paginate(c)
-	expenses, total, err := h.service.List(shared.MustBusinessID(c), svcExpense.ListFilter{
+	cur, limit := shared.CursorParams(c)
+	expenses, nextCursor, err := h.service.List(shared.MustBusinessID(c), svcExpense.ListFilter{
 		StoreID:     shared.QueryUUID(c, "store_id"),
 		ExpenseType: c.Query("expense_type"),
 		Category:    c.Query("category"),
 		DateFrom:    shared.QueryTime(c, "date_from"),
 		DateTo:      shared.QueryTime(c, "date_to"),
-		Page:        page,
+		Cursor:      cur,
 		Limit:       limit,
 	})
 	if err != nil {
 		response.InternalError(c, err.Error())
 		return
 	}
-	response.List(c, expenses, total, page, limit)
+	response.CursorList(c, expenses, nextCursor)
 }
 
-// GET /expenses/summary?year=2025&month=1
-// NOTE: registered before /expenses/:id so the router sees /summary first
+// GET /expenses/summary
 func (h *Handler) MonthlySummary(c *gin.Context) {
 	year := shared.QueryInt(c, "year", 0)
 	month := shared.QueryInt(c, "month", 0)

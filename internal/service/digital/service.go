@@ -13,6 +13,7 @@ import (
 
 	"ogaos-backend/internal/domain/models"
 	"ogaos-backend/internal/external/imagekit"
+	"ogaos-backend/internal/pkg/cursor"
 	"ogaos-backend/internal/pkg/email"
 )
 
@@ -92,22 +93,33 @@ func (s *Service) GetPublic(slug string) (*models.DigitalProduct, error) {
 	return &p, nil
 }
 
-func (s *Service) List(businessID uuid.UUID, page, limit int) ([]models.DigitalProduct, int64, error) {
-	if page < 1 {
-		page = 1
-	}
+func (s *Service) List(businessID uuid.UUID, cur string, limit int) ([]models.DigitalProduct, string, error) {
 	if limit < 1 || limit > 100 {
 		limit = 20
 	}
-	offset := (page - 1) * limit
 
-	var total int64
-	s.db.Model(&models.DigitalProduct{}).Where("business_id = ?", businessID).Count(&total)
+	q := s.db.Model(&models.DigitalProduct{}).Where("business_id = ?", businessID)
+
+	if cur != "" {
+		cursorTime, id, err := cursor.Decode(cur)
+		if err != nil {
+			return nil, "", errors.New("invalid cursor")
+		}
+		q = q.Where("(created_at, id) < (?, ?)", cursorTime, id)
+	}
 
 	var products []models.DigitalProduct
-	err := s.db.Where("business_id = ?", businessID).
-		Offset(offset).Limit(limit).Order("created_at DESC").Find(&products).Error
-	return products, total, err
+	if err := q.Order("created_at DESC, id DESC").Limit(limit + 1).Find(&products).Error; err != nil {
+		return nil, "", err
+	}
+
+	var nextCursor string
+	if len(products) > limit {
+		last := products[limit-1]
+		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
+		products = products[:limit]
+	}
+	return products, nextCursor, nil
 }
 
 func (s *Service) Update(businessID, productID uuid.UUID, req UpdateRequest) (*models.DigitalProduct, error) {

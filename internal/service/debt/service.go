@@ -9,6 +9,7 @@ import (
 	"gorm.io/gorm"
 
 	"ogaos-backend/internal/domain/models"
+	"ogaos-backend/internal/pkg/cursor"
 )
 
 type Service struct {
@@ -42,7 +43,7 @@ type ListFilter struct {
 	Status     string
 	CustomerID *uuid.UUID
 	Overdue    bool
-	Page       int
+	Cursor     string
 	Limit      int
 }
 
@@ -97,14 +98,10 @@ func (s *Service) Get(businessID, debtID uuid.UUID) (*models.Debt, error) {
 	return &d, nil
 }
 
-func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Debt, int64, error) {
-	if filter.Page < 1 {
-		filter.Page = 1
-	}
+func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Debt, string, error) {
 	if filter.Limit < 1 || filter.Limit > 100 {
 		filter.Limit = 20
 	}
-	offset := (filter.Page - 1) * filter.Limit
 
 	q := s.db.Model(&models.Debt{}).Where("business_id = ?", businessID)
 	if filter.Direction != "" {
@@ -120,12 +117,26 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Debt, 
 		q = q.Where("due_date < ? AND status NOT IN ?", time.Now(), []string{models.DebtStatusSettled})
 	}
 
-	var total int64
-	q.Count(&total)
+	if filter.Cursor != "" {
+		cur, id, err := cursor.Decode(filter.Cursor)
+		if err != nil {
+			return nil, "", errors.New("invalid cursor")
+		}
+		q = q.Where("(created_at, id) < (?, ?)", cur, id)
+	}
 
 	var debts []models.Debt
-	err := q.Preload("Customer").Offset(offset).Limit(filter.Limit).Order("created_at DESC").Find(&debts).Error
-	return debts, total, err
+	if err := q.Preload("Customer").Order("created_at DESC, id DESC").Limit(filter.Limit + 1).Find(&debts).Error; err != nil {
+		return nil, "", err
+	}
+
+	var nextCursor string
+	if len(debts) > filter.Limit {
+		last := debts[filter.Limit-1]
+		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
+		debts = debts[:filter.Limit]
+	}
+	return debts, nextCursor, nil
 }
 
 // RecordPayment applies a payment to a debt, recalculates status.

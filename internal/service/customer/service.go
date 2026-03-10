@@ -8,6 +8,7 @@ import (
 	"gorm.io/gorm"
 
 	"ogaos-backend/internal/domain/models"
+	"ogaos-backend/internal/pkg/cursor"
 )
 
 type Service struct {
@@ -40,8 +41,8 @@ type UpdateRequest struct {
 
 type ListFilter struct {
 	Search string
-	Page   int
-	Limit  int
+	Cursor string // opaque; "" = first page
+	Limit  int    // default 20, max 100
 }
 
 // ─── Methods ─────────────────────────────────────────────────────────────────
@@ -70,14 +71,10 @@ func (s *Service) Get(businessID, customerID uuid.UUID) (*models.Customer, error
 	return &c, nil
 }
 
-func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Customer, int64, error) {
-	if filter.Page < 1 {
-		filter.Page = 1
-	}
+func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Customer, string, error) {
 	if filter.Limit < 1 || filter.Limit > 100 {
 		filter.Limit = 20
 	}
-	offset := (filter.Page - 1) * filter.Limit
 
 	q := s.db.Model(&models.Customer{}).Where("business_id = ? AND is_active = true", businessID)
 	if filter.Search != "" {
@@ -85,14 +82,26 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Custom
 		q = q.Where("first_name ILIKE ? OR last_name ILIKE ? OR email ILIKE ? OR phone_number ILIKE ?", like, like, like, like)
 	}
 
-	var total int64
-	q.Count(&total)
+	if filter.Cursor != "" {
+		cur, id, err := cursor.Decode(filter.Cursor)
+		if err != nil {
+			return nil, "", errors.New("invalid cursor")
+		}
+		q = q.Where("(created_at, id) < (?, ?)", cur, id)
+	}
 
 	var customers []models.Customer
-	if err := q.Offset(offset).Limit(filter.Limit).Order("created_at DESC").Find(&customers).Error; err != nil {
-		return nil, 0, err
+	if err := q.Order("created_at DESC, id DESC").Limit(filter.Limit + 1).Find(&customers).Error; err != nil {
+		return nil, "", err
 	}
-	return customers, total, nil
+
+	var nextCursor string
+	if len(customers) > filter.Limit {
+		last := customers[filter.Limit-1]
+		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
+		customers = customers[:filter.Limit]
+	}
+	return customers, nextCursor, nil
 }
 
 func (s *Service) Update(businessID, customerID uuid.UUID, req UpdateRequest) (*models.Customer, error) {

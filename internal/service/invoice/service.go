@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"ogaos-backend/internal/domain/models"
+	"ogaos-backend/internal/pkg/cursor"
 	"ogaos-backend/internal/pkg/email"
 )
 
@@ -51,7 +52,7 @@ type ListFilter struct {
 	CustomerID *uuid.UUID
 	DateFrom   *time.Time
 	DateTo     *time.Time
-	Page       int
+	Cursor     string
 	Limit      int
 }
 
@@ -128,14 +129,10 @@ func (s *Service) Get(businessID, invoiceID uuid.UUID) (*models.Invoice, error) 
 	return &inv, nil
 }
 
-func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Invoice, int64, error) {
-	if filter.Page < 1 {
-		filter.Page = 1
-	}
+func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Invoice, string, error) {
 	if filter.Limit < 1 || filter.Limit > 100 {
 		filter.Limit = 20
 	}
-	offset := (filter.Page - 1) * filter.Limit
 
 	q := s.db.Model(&models.Invoice{}).Where("business_id = ?", businessID)
 	if filter.Status != "" {
@@ -151,12 +148,26 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Invoic
 		q = q.Where("issue_date <= ?", *filter.DateTo)
 	}
 
-	var total int64
-	q.Count(&total)
+	if filter.Cursor != "" {
+		cur, id, err := cursor.Decode(filter.Cursor)
+		if err != nil {
+			return nil, "", errors.New("invalid cursor")
+		}
+		q = q.Where("(created_at, id) < (?, ?)", cur, id)
+	}
 
 	var invoices []models.Invoice
-	err := q.Preload("Customer").Offset(offset).Limit(filter.Limit).Order("created_at DESC").Find(&invoices).Error
-	return invoices, total, err
+	if err := q.Preload("Customer").Order("created_at DESC, id DESC").Limit(filter.Limit + 1).Find(&invoices).Error; err != nil {
+		return nil, "", err
+	}
+
+	var nextCursor string
+	if len(invoices) > filter.Limit {
+		last := invoices[filter.Limit-1]
+		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
+		invoices = invoices[:filter.Limit]
+	}
+	return invoices, nextCursor, nil
 }
 
 // Send marks an invoice as sent and emails the customer.
