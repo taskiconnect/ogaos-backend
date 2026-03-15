@@ -42,13 +42,10 @@ func SetupAuthRoutes(
 	digitalHandler *digital.Handler,
 	webhookHandler *webhook.Handler,
 ) {
-	// ── Global ────────────────────────────────────────────────────────────────
 	r.Use(middleware.CORSMiddleware(cfg.AllowedOrigins))
 
-	// ── Health ────────────────────────────────────────────────────────────────
 	r.GET("/health", healthHandler.Check)
 
-	// ── Webhooks (raw body, no JWT) ───────────────────────────────────────────
 	webhooks := r.Group("/webhooks")
 	{
 		webhooks.POST("/paystack", webhookHandler.Paystack)
@@ -57,7 +54,6 @@ func SetupAuthRoutes(
 
 	v1 := r.Group("/api/v1")
 
-	// ── Auth (public) ─────────────────────────────────────────────────────────
 	authGroup := v1.Group("/auth")
 	{
 		authGroup.POST("/register", authHandler.Register)
@@ -65,17 +61,14 @@ func SetupAuthRoutes(
 		authGroup.POST("/refresh", authHandler.Refresh)
 		authGroup.POST("/logout", authHandler.Logout)
 		authGroup.GET("/verify", authHandler.VerifyEmail)
-		authGroup.POST("/resend-verification", authHandler.ResendVerification)
 	}
 
-	// ── Location (public — needed at signup before account exists) ────────────
 	locGroup := v1.Group("/locations")
 	{
 		locGroup.GET("/states", locationHandler.GetStates)
 		locGroup.GET("/lgas", locationHandler.GetLGAs)
 	}
 
-	// ── Public storefront & jobs (no JWT) ─────────────────────────────────────
 	public := v1.Group("/public")
 	{
 		public.GET("/business/:slug", businessHandler.GetPublicProfile)
@@ -89,14 +82,11 @@ func SetupAuthRoutes(
 		public.GET("/orders/:order_id/download", digitalHandler.GetDownload)
 	}
 
-	// ── Protected (JWT required for everything below) ─────────────────────────
 	protected := v1.Group("")
 	protected.Use(middleware.AuthMiddleware([]byte(cfg.JWTSecret)))
 
-	// Auth — me
 	protected.GET("/auth/me", authHandler.WhoAmI)
 
-	// ── Business ──────────────────────────────────────────────────────────────
 	biz := protected.Group("/business")
 	biz.Use(middleware.RequireRole(middleware.RoleOwner))
 	{
@@ -106,15 +96,15 @@ func SetupAuthRoutes(
 		biz.PATCH("/me/visibility", businessHandler.SetVisibility)
 	}
 
-	// ── Staff ─────────────────────────────────────────────────────────────────
+	// -- Staff --------------------------------------------------------------
 	staff := protected.Group("/staff")
 	staff.Use(middleware.RequireRole(middleware.RoleOwner))
 	{
+		staff.GET("", authHandler.ListStaff) // - NEW: returns staff list
 		staff.POST("", authHandler.CreateStaff)
 		staff.DELETE("/:id", authHandler.DeactivateStaff)
 	}
 
-	// ── Stores ────────────────────────────────────────────────────────────────
 	stores := protected.Group("/stores")
 	stores.Use(middleware.SubscriptionGuard(db, "stores"))
 	{
@@ -126,7 +116,6 @@ func SetupAuthRoutes(
 		stores.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), storeHandler.Delete)
 	}
 
-	// ── Customers ─────────────────────────────────────────────────────────────
 	customers := protected.Group("/customers")
 	{
 		customers.POST("", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), middleware.LimitGuard(db, "customers"), customerHandler.Create)
@@ -136,7 +125,6 @@ func SetupAuthRoutes(
 		customers.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), customerHandler.Delete)
 	}
 
-	// ── Products ──────────────────────────────────────────────────────────────
 	products := protected.Group("/products")
 	{
 		products.POST("", middleware.RequireRole(middleware.RoleOwner), middleware.LimitGuard(db, "products"), productHandler.Create)
@@ -148,7 +136,6 @@ func SetupAuthRoutes(
 		products.POST("/:id/image", middleware.RequireRole(middleware.RoleOwner), productHandler.UploadImage)
 	}
 
-	// ── Sales ─────────────────────────────────────────────────────────────────
 	sales := protected.Group("/sales")
 	{
 		sales.POST("", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.Create)
@@ -157,7 +144,6 @@ func SetupAuthRoutes(
 		sales.POST("/:id/receipt", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.GenerateReceipt)
 	}
 
-	// ── Invoices ──────────────────────────────────────────────────────────────
 	invoices := protected.Group("/invoices")
 	invoices.Use(middleware.SubscriptionGuard(db, "invoices"))
 	{
@@ -169,11 +155,9 @@ func SetupAuthRoutes(
 		invoices.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.Cancel)
 	}
 
-	// ── Expenses ──────────────────────────────────────────────────────────────
 	expenses := protected.Group("/expenses")
 	expenses.Use(middleware.SubscriptionGuard(db, "expense_tracking"))
 	{
-		// /summary must be registered before /:id to avoid Gin matching "summary" as an id
 		expenses.GET("/summary", middleware.RequireRole(middleware.RoleOwner), expenseHandler.MonthlySummary)
 		expenses.POST("", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), expenseHandler.Create)
 		expenses.GET("", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), expenseHandler.List)
@@ -182,7 +166,6 @@ func SetupAuthRoutes(
 		expenses.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), expenseHandler.Delete)
 	}
 
-	// ── Debts ─────────────────────────────────────────────────────────────────
 	debts := protected.Group("/debts")
 	debts.Use(middleware.SubscriptionGuard(db, "debt_tracking"))
 	{
@@ -192,7 +175,6 @@ func SetupAuthRoutes(
 		debts.POST("/:id/payment", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), debtHandler.RecordPayment)
 	}
 
-	// ── Recruitment ───────────────────────────────────────────────────────────
 	recruit := protected.Group("")
 	recruit.Use(middleware.SubscriptionGuard(db, "recruitment"))
 	{
@@ -207,7 +189,6 @@ func SetupAuthRoutes(
 		apps.PATCH("/:id/review", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), recruitmentHandler.ReviewApplication)
 	}
 
-	// ── Digital products ──────────────────────────────────────────────────────
 	dp := protected.Group("/digital-products")
 	{
 		dp.POST("", middleware.RequireRole(middleware.RoleOwner), digitalHandler.Create)

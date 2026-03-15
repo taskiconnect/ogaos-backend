@@ -28,7 +28,7 @@ func send(to, subject, html string) error {
 
 	fromEmail := os.Getenv("EMAIL_FROM")
 	if fromEmail == "" {
-		fromEmail = "hello@ogaos.com"
+		fromEmail = "hello@taskiconnect.com"
 	}
 
 	payload := resendPayload{

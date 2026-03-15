@@ -82,6 +82,8 @@ type AuthService struct {
 	frontendURL string
 }
 
+// NewAuthService creates a new instance of AuthService
+// This constructor is what cmd/api/main.go is trying to call
 func NewAuthService(
 	db *gorm.DB,
 	jwtSecret []byte,
@@ -106,6 +108,8 @@ type Handler struct {
 	service *AuthService
 }
 
+// NewHandler creates a new auth handler instance
+// This constructor is what cmd/api/main.go is trying to call
 func NewHandler(service *AuthService) *Handler {
 	return &Handler{service: service}
 }
@@ -194,67 +198,6 @@ func (s *AuthService) VerifyEmail(token string) error {
 }
 
 // ────────────────────────────────────────────────
-// ResendVerification
-// Issues a new verification email for unverified accounts.
-// Rules:
-//  1. If the existing token is still valid, reuse it (don't spam).
-//  2. If expired or missing, generate a fresh 48-hour token.
-//  3. Always return a generic success message — never leak
-//     whether an email address is registered or not.
-// ────────────────────────────────────────────────
-
-func (s *AuthService) ResendVerification(emailAddr string) error {
-	var user models.User
-	if err := s.db.Where("email = ?", emailAddr).First(&user).Error; err != nil {
-		// Generic message so we don't leak whether the email exists
-		return nil
-	}
-
-	// Already verified — nothing to do
-	if user.EmailVerifiedAt != nil {
-		return nil
-	}
-
-	now := time.Now()
-	token := ""
-
-	if user.VerificationToken != nil &&
-		user.VerificationExpiresAt != nil &&
-		user.VerificationExpiresAt.After(now) {
-		// Valid token still exists — reuse it
-		token = *user.VerificationToken
-	} else {
-		// Expired or missing — generate a fresh one
-		token = uuid.NewString()
-		expiresAt := now.Add(48 * time.Hour)
-		if err := s.db.Model(&user).Updates(map[string]interface{}{
-			"verification_token":      token,
-			"verification_expires_at": expiresAt,
-		}).Error; err != nil {
-			return err
-		}
-	}
-
-	businessName := s.getBusinessName(user.ID)
-	email.SendVerificationEmail(user.Email, token, s.frontendURL, businessName)
-	return nil
-}
-
-// getBusinessName looks up the business name for a given user.
-// Returns a safe fallback if not found.
-func (s *AuthService) getBusinessName(userID uuid.UUID) string {
-	var bu models.BusinessUser
-	if err := s.db.Where("user_id = ?", userID).First(&bu).Error; err != nil {
-		return "your business"
-	}
-	var business models.Business
-	if err := s.db.First(&business, bu.BusinessID).Error; err != nil {
-		return "your business"
-	}
-	return business.Name
-}
-
-// ────────────────────────────────────────────────
 // Login – supports both regular users and platform admins
 // ────────────────────────────────────────────────
 
@@ -263,7 +206,7 @@ func (s *AuthService) Login(emailAddr, password string) (accessToken, refreshTok
 	var user models.User
 	if err = s.db.Where("email = ?", emailAddr).First(&user).Error; err == nil {
 		if user.EmailVerifiedAt == nil {
-			return "", "", errors.New("email not verified. Please check your inbox or request a new verification link")
+			return "", "", errors.New("email not verified")
 		}
 		if !user.IsActive {
 			return "", "", errors.New("account deactivated")
@@ -341,6 +284,7 @@ func (s *AuthService) Refresh(refreshToken string) (newAccess string, newRefresh
 
 	s.db.Model(&rt).Update("revoked", true)
 
+	// Find user or admin
 	var user models.User
 	if err = s.db.First(&user, rt.UserID).Error; err == nil {
 		var bu models.BusinessUser
@@ -489,4 +433,88 @@ func (s *AuthService) DeactivateStaff(businessID uuid.UUID, staffUserID uuid.UUI
 	}
 
 	return s.db.Model(&link).Update("is_active", false).Error
+}
+
+type StaffMember struct {
+	ID          uuid.UUID `json:"id"`
+	FirstName   string    `json:"first_name"`
+	LastName    string    `json:"last_name"`
+	Email       string    `json:"email"`
+	PhoneNumber string    `json:"phone_number"`
+	Role        string    `json:"role"`
+	IsActive    bool      `json:"is_active"`
+	JoinedAt    time.Time `json:"joined_at"`
+}
+
+func (s *AuthService) ListStaff(businessID uuid.UUID) ([]StaffMember, error) {
+	type row struct {
+		ID          uuid.UUID
+		FirstName   string
+		LastName    string
+		Email       string
+		PhoneNumber string
+		Role        string
+		IsActive    bool
+		JoinedAt    time.Time
+	}
+
+	var rows []row
+	err := s.db.
+		Table("business_users bu").
+		Select("u.id, u.first_name, u.last_name, u.email, u.phone_number, bu.role, bu.is_active, bu.created_at as joined_at").
+		Joins("JOIN users u ON u.id = bu.user_id").
+		Where("bu.business_id = ? AND bu.role = 'staff'", businessID).
+		Order("bu.created_at DESC").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	members := make([]StaffMember, len(rows))
+	for i, r := range rows {
+		members[i] = StaffMember{
+			ID:          r.ID,
+			FirstName:   r.FirstName,
+			LastName:    r.LastName,
+			Email:       r.Email,
+			PhoneNumber: r.PhoneNumber,
+			Role:        r.Role,
+			IsActive:    r.IsActive,
+			JoinedAt:    r.JoinedAt,
+		}
+	}
+	return members, nil
+}
+
+func (s *AuthService) ResendVerification(emailAddr string) error {
+	var user models.User
+	if err := s.db.Where("email = ?", emailAddr).First(&user).Error; err != nil {
+		return errors.New("user not found")
+	}
+
+	if user.EmailVerifiedAt != nil {
+		return errors.New("email already verified")
+	}
+
+	token := uuid.NewString()
+	expiresAt := time.Now().Add(48 * time.Hour)
+
+	if err := s.db.Model(&user).Updates(map[string]interface{}{
+		"verification_token":      token,
+		"verification_expires_at": expiresAt,
+	}).Error; err != nil {
+		return err
+	}
+
+	var bu models.BusinessUser
+	var businessName string
+	if s.db.Where("user_id = ?", user.ID).First(&bu).Error == nil {
+		var business models.Business
+		if s.db.First(&business, bu.BusinessID).Error == nil {
+			businessName = business.Name
+		}
+	}
+
+	email.SendVerificationEmail(user.Email, token, s.frontendURL, businessName)
+	return nil
 }
