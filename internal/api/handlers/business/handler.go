@@ -3,6 +3,7 @@ package business
 
 import (
 	"io"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -88,7 +89,67 @@ func (h *Handler) SetVisibility(c *gin.Context) {
 	response.Message(c, "visibility updated")
 }
 
-// GET /public/business/:slug  — no auth
+// POST /business/me/gallery  — multipart/form-data, field: "image"
+func (h *Handler) AddGalleryImage(c *gin.Context) {
+	businessID := shared.MustBusinessID(c)
+	file, header, err := c.Request.FormFile("image")
+	if err != nil {
+		response.BadRequest(c, "image file is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		response.InternalError(c, "failed to read file")
+		return
+	}
+	result, err := h.upload.UploadBusinessGalleryImage(businessID, data, header.Filename)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	b, err := h.service.AddGalleryImage(businessID, result.URL)
+	if err != nil {
+		response.Err(c, err)
+		return
+	}
+	response.OK(c, b)
+}
+
+// DELETE /business/me/gallery/:index
+func (h *Handler) RemoveGalleryImage(c *gin.Context) {
+	index, err := strconv.Atoi(c.Param("index"))
+	if err != nil {
+		response.BadRequest(c, "invalid gallery index")
+		return
+	}
+	b, err := h.service.RemoveGalleryImage(shared.MustBusinessID(c), index)
+	if err != nil {
+		response.Err(c, err)
+		return
+	}
+	response.OK(c, b)
+}
+
+// PATCH /business/me/storefront-video
+// Body: { "video_url": "https://youtube.com/..." }  — pass empty string to clear
+func (h *Handler) SetStorefrontVideo(c *gin.Context) {
+	var req struct {
+		VideoURL string `json:"video_url"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	b, err := h.service.SetStorefrontVideo(shared.MustBusinessID(c), req.VideoURL)
+	if err != nil {
+		response.Err(c, err)
+		return
+	}
+	response.OK(c, b)
+}
+
+// GET /public/business/:slug  — no auth required
 func (h *Handler) GetPublicProfile(c *gin.Context) {
 	b, err := h.service.GetPublicProfile(c.Param("slug"))
 	if err != nil {

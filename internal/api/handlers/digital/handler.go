@@ -3,6 +3,7 @@ package digital
 
 import (
 	"io"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -93,7 +94,7 @@ func (h *Handler) Delete(c *gin.Context) {
 	response.Message(c, "product deleted")
 }
 
-// POST /digital-products/:id/file
+// POST /digital-products/:id/file  — multipart, field: "file"
 func (h *Handler) UploadFile(c *gin.Context) {
 	id, ok := shared.ParseID(c, "id")
 	if !ok {
@@ -123,7 +124,7 @@ func (h *Handler) UploadFile(c *gin.Context) {
 	response.Message(c, "file uploaded successfully")
 }
 
-// POST /digital-products/:id/cover
+// POST /digital-products/:id/cover  — multipart, field: "cover"
 func (h *Handler) UploadCover(c *gin.Context) {
 	id, ok := shared.ParseID(c, "id")
 	if !ok {
@@ -152,6 +153,57 @@ func (h *Handler) UploadCover(c *gin.Context) {
 	response.OK(c, gin.H{"cover_image_url": result.URL})
 }
 
+// POST /digital-products/:id/gallery  — multipart, field: "image"
+func (h *Handler) AddGalleryImage(c *gin.Context) {
+	id, ok := shared.ParseID(c, "id")
+	if !ok {
+		return
+	}
+	file, header, err := c.Request.FormFile("image")
+	if err != nil {
+		response.BadRequest(c, "image is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		response.InternalError(c, "failed to read file")
+		return
+	}
+	result, err := h.upload.UploadProductGalleryImage(id, data, header.Filename)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	p, err := h.service.AddGalleryImage(shared.MustBusinessID(c), id, result.URL)
+	if err != nil {
+		response.Err(c, err)
+		return
+	}
+	response.OK(c, p)
+}
+
+// DELETE /digital-products/:id/gallery/:index
+func (h *Handler) RemoveGalleryImage(c *gin.Context) {
+	id, ok := shared.ParseID(c, "id")
+	if !ok {
+		return
+	}
+	index, err := strconv.Atoi(c.Param("index"))
+	if err != nil {
+		response.BadRequest(c, "invalid gallery index")
+		return
+	}
+	p, err := h.service.RemoveGalleryImage(shared.MustBusinessID(c), id, index)
+	if err != nil {
+		response.Err(c, err)
+		return
+	}
+	response.OK(c, p)
+}
+
+// ─── Public storefront ────────────────────────────────────────────────────────
+
 // GET /public/store/:slug
 func (h *Handler) GetPublicProduct(c *gin.Context) {
 	p, err := h.service.GetPublic(c.Param("slug"))
@@ -160,6 +212,16 @@ func (h *Handler) GetPublicProduct(c *gin.Context) {
 		return
 	}
 	response.OK(c, p)
+}
+
+// GET /public/business/:slug/products
+func (h *Handler) ListPublicProducts(c *gin.Context) {
+	products, err := h.service.ListPublic(c.Param("slug"))
+	if err != nil {
+		response.NotFound(c, err.Error())
+		return
+	}
+	response.OK(c, products)
 }
 
 // POST /public/store/:id/purchase
@@ -184,7 +246,7 @@ func (h *Handler) Purchase(c *gin.Context) {
 	})
 }
 
-// GET /public/orders/:order_id/download
+// GET /public/orders/:order_id/download?email=buyer@example.com
 func (h *Handler) GetDownload(c *gin.Context) {
 	orderID, ok := shared.ParseID(c, "order_id")
 	if !ok {

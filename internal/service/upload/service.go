@@ -21,15 +21,17 @@ func NewService(client *imagekit.Client) *Service {
 	return &Service{client: client}
 }
 
-// ─── Folders ─────────────────────────────────────────────────────────────────
+// ─── Folders ──────────────────────────────────────────────────────────────────
 
 const (
-	FolderLogos         = "logos"
-	FolderProductImages = "products"
-	FolderDigitalFiles  = "digital-products"
-	FolderCoverImages   = "covers"
-	FolderReceiptPDFs   = "documents"
-	FolderCVs           = "cvs"
+	FolderLogos           = "logos"
+	FolderProductImages   = "products"
+	FolderDigitalFiles    = "digital-products"
+	FolderCoverImages     = "covers"
+	FolderReceiptPDFs     = "documents"
+	FolderCVs             = "cvs"
+	FolderProductGallery  = "product-gallery"
+	FolderBusinessGallery = "business-gallery"
 )
 
 // ─── Result ───────────────────────────────────────────────────────────────────
@@ -44,7 +46,6 @@ type UploadResult struct {
 // ─── Methods ─────────────────────────────────────────────────────────────────
 
 // UploadLogo uploads a business logo as a public image.
-// Returns the public URL to store in business.logo_url.
 func (s *Service) UploadLogo(businessID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
 	ext := safeExt(originalName)
 	if !isImageExt(ext) {
@@ -83,7 +84,7 @@ func (s *Service) UploadProductImage(productID uuid.UUID, data []byte, originalN
 }
 
 // UploadDigitalProductFile uploads the private downloadable file for a digital product.
-// The file is stored as private — access requires a signed URL.
+// Stored as private — access requires a signed URL.
 func (s *Service) UploadDigitalProductFile(productID uuid.UUID, data []byte, originalName, mimeType string) (*UploadResult, error) {
 	ext := safeExt(originalName)
 	fileName := fmt.Sprintf("dp-%s-%d%s", productID.String()[:8], time.Now().UnixMilli(), ext)
@@ -91,13 +92,13 @@ func (s *Service) UploadDigitalProductFile(productID uuid.UUID, data []byte, ori
 		File:      data,
 		FileName:  fileName,
 		Folder:    FolderDigitalFiles,
-		IsPrivate: true, // ← critical: private file, requires signed URL
+		IsPrivate: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("digital product file upload failed: %w", err)
 	}
 	return &UploadResult{
-		URL:      resp.FilePath, // store the path, not the public URL
+		URL:      resp.FilePath, // store path, not public URL
 		FileID:   resp.FileID,
 		FileSize: int64(resp.Size),
 		MimeType: mimeType,
@@ -119,6 +120,44 @@ func (s *Service) UploadCoverImage(productID uuid.UUID, data []byte, originalNam
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cover image upload failed: %w", err)
+	}
+	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
+}
+
+// UploadProductGalleryImage uploads one of up to 3 gallery images for a digital product.
+func (s *Service) UploadProductGalleryImage(productID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
+	ext := safeExt(originalName)
+	if !isImageExt(ext) {
+		return nil, errors.New("gallery image must be jpg, png, or webp")
+	}
+	fileName := fmt.Sprintf("prod-gallery-%s-%d%s", productID.String()[:8], time.Now().UnixMilli(), ext)
+	resp, err := s.client.Upload(imagekit.UploadRequest{
+		File:      data,
+		FileName:  fileName,
+		Folder:    FolderProductGallery,
+		IsPrivate: false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("product gallery upload failed: %w", err)
+	}
+	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
+}
+
+// UploadBusinessGalleryImage uploads one of up to 3 storefront gallery images for a business.
+func (s *Service) UploadBusinessGalleryImage(businessID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
+	ext := safeExt(originalName)
+	if !isImageExt(ext) {
+		return nil, errors.New("gallery image must be jpg, png, or webp")
+	}
+	fileName := fmt.Sprintf("biz-gallery-%s-%d%s", businessID.String()[:8], time.Now().UnixMilli(), ext)
+	resp, err := s.client.Upload(imagekit.UploadRequest{
+		File:      data,
+		FileName:  fileName,
+		Folder:    FolderBusinessGallery,
+		IsPrivate: false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("business gallery upload failed: %w", err)
 	}
 	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
 }

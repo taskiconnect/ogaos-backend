@@ -2,6 +2,7 @@
 package digital
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -33,7 +34,7 @@ func NewService(db *gorm.DB, ikClient *imagekit.Client, frontendURL string, plat
 	}
 }
 
-// ─── DTOs ────────────────────────────────────────────────────────────────────
+// ─── DTOs ─────────────────────────────────────────────────────────────────────
 
 type CreateRequest struct {
 	Title         string  `json:"title" binding:"required"`
@@ -54,21 +55,25 @@ type UpdateRequest struct {
 type PurchaseRequest struct {
 	BuyerName  string `json:"buyer_name" binding:"required"`
 	BuyerEmail string `json:"buyer_email" binding:"required,email"`
-	Reference  string `json:"reference" binding:"required"` // Paystack/Flutterwave transaction ref
+	Reference  string `json:"reference" binding:"required"` // Paystack/Flutterwave ref
 	Channel    string `json:"channel" binding:"required"`   // "paystack" | "flutterwave"
 }
 
 // ─── Product management ───────────────────────────────────────────────────────
 
+// Create creates a new digital product and sets its 180-day expiry clock.
 func (s *Service) Create(businessID uuid.UUID, req CreateRequest) (*models.DigitalProduct, error) {
+	expiry := time.Now().AddDate(0, 0, models.DigitalProductLifetimeDays)
 	p := models.DigitalProduct{
-		BusinessID:    businessID,
-		Title:         req.Title,
-		Slug:          s.generateSlug(req.Title),
-		Description:   req.Description,
-		Type:          req.Type,
-		Price:         req.Price,
-		PromoVideoURL: req.PromoVideoURL,
+		BusinessID:       businessID,
+		Title:            req.Title,
+		Slug:             s.generateSlug(req.Title),
+		Description:      req.Description,
+		Type:             req.Type,
+		Price:            req.Price,
+		PromoVideoURL:    req.PromoVideoURL,
+		GalleryImageURLs: "[]",
+		ExpiresAt:        &expiry,
 	}
 	if err := s.db.Create(&p).Error; err != nil {
 		return nil, err
@@ -76,6 +81,7 @@ func (s *Service) Create(businessID uuid.UUID, req CreateRequest) (*models.Digit
 	return &p, nil
 }
 
+// Get returns a digital product owned by the given business.
 func (s *Service) Get(businessID, productID uuid.UUID) (*models.DigitalProduct, error) {
 	var p models.DigitalProduct
 	if err := s.db.Where("id = ? AND business_id = ?", productID, businessID).First(&p).Error; err != nil {
@@ -84,7 +90,7 @@ func (s *Service) Get(businessID, productID uuid.UUID) (*models.DigitalProduct, 
 	return &p, nil
 }
 
-// GetPublic returns a published digital product by slug for the storefront.
+// GetPublic returns a published digital product by slug for the public storefront.
 func (s *Service) GetPublic(slug string) (*models.DigitalProduct, error) {
 	var p models.DigitalProduct
 	if err := s.db.Where("slug = ? AND is_published = true", slug).First(&p).Error; err != nil {
@@ -93,6 +99,22 @@ func (s *Service) GetPublic(slug string) (*models.DigitalProduct, error) {
 	return &p, nil
 }
 
+// ListPublic returns all published products for a business identified by its slug.
+// Used by the public storefront — no authentication required.
+func (s *Service) ListPublic(businessSlug string) ([]models.DigitalProduct, error) {
+	var b models.Business
+	if err := s.db.Select("id").Where("slug = ? AND is_profile_public = true", businessSlug).First(&b).Error; err != nil {
+		return nil, errors.New("business not found")
+	}
+	var products []models.DigitalProduct
+	err := s.db.
+		Where("business_id = ? AND is_published = true", b.ID).
+		Order("created_at DESC").
+		Find(&products).Error
+	return products, err
+}
+
+// List returns digital products for the given business using cursor-based pagination.
 func (s *Service) List(businessID uuid.UUID, cur string, limit int) ([]models.DigitalProduct, string, error) {
 	if limit < 1 || limit > 100 {
 		limit = 20
@@ -122,6 +144,7 @@ func (s *Service) List(businessID uuid.UUID, cur string, limit int) ([]models.Di
 	return products, nextCursor, nil
 }
 
+// Update updates editable fields on a digital product.
 func (s *Service) Update(businessID, productID uuid.UUID, req UpdateRequest) (*models.DigitalProduct, error) {
 	var p models.DigitalProduct
 	if err := s.db.Where("id = ? AND business_id = ?", productID, businessID).First(&p).Error; err != nil {
@@ -152,14 +175,11 @@ func (s *Service) Update(businessID, productID uuid.UUID, req UpdateRequest) (*m
 	return &p, nil
 }
 
+// Delete removes a digital product.
 func (s *Service) Delete(businessID, productID uuid.UUID) error {
 	var p models.DigitalProduct
 	if err := s.db.Where("id = ? AND business_id = ?", productID, businessID).First(&p).Error; err != nil {
 		return errors.New("digital product not found")
-	}
-	// Clean up ImageKit files if stored
-	if p.FileURL != nil {
-		// FileID is stored separately — handled by upload service
 	}
 	return s.db.Delete(&p).Error
 }
@@ -190,10 +210,75 @@ func (s *Service) AttachCoverImage(businessID, productID uuid.UUID, coverURL str
 	return result.Error
 }
 
+// ─── Gallery ──────────────────────────────────────────────────────────────────
+
+// AddGalleryImage adds an image URL to the product's gallery (max 3).
+func (s *Service) AddGalleryImage(businessID, productID uuid.UUID, imageURL string) (*models.DigitalProduct, error) {
+	var p models.DigitalProduct
+	if err := s.db.Where("id = ? AND business_id = ?", productID, businessID).First(&p).Error; err != nil {
+		return nil, errors.New("digital product not found")
+	}
+	gallery := parseGallery(p.GalleryImageURLs)
+	if len(gallery) >= 3 {
+		return nil, errors.New("maximum 3 gallery images allowed per product")
+	}
+	gallery = append(gallery, imageURL)
+	if err := s.db.Model(&p).Update("gallery_image_urls", marshalGallery(gallery)).Error; err != nil {
+		return nil, err
+	}
+	p.GalleryImageURLs = marshalGallery(gallery)
+	return &p, nil
+}
+
+// RemoveGalleryImage removes a gallery image at the given zero-based index.
+func (s *Service) RemoveGalleryImage(businessID, productID uuid.UUID, index int) (*models.DigitalProduct, error) {
+	var p models.DigitalProduct
+	if err := s.db.Where("id = ? AND business_id = ?", productID, businessID).First(&p).Error; err != nil {
+		return nil, errors.New("digital product not found")
+	}
+	gallery := parseGallery(p.GalleryImageURLs)
+	if index < 0 || index >= len(gallery) {
+		return nil, errors.New("invalid gallery index")
+	}
+	gallery = append(gallery[:index], gallery[index+1:]...)
+	if err := s.db.Model(&p).Update("gallery_image_urls", marshalGallery(gallery)).Error; err != nil {
+		return nil, err
+	}
+	p.GalleryImageURLs = marshalGallery(gallery)
+	return &p, nil
+}
+
+// ─── Expiry ───────────────────────────────────────────────────────────────────
+
+// ExpireOldProducts unpublishes digital products that have passed their expires_at date.
+// Also catches products without an explicit expires_at that are older than 180 days.
+// Call this from your daily scheduler.
+func (s *Service) ExpireOldProducts() (int64, error) {
+	now := time.Now()
+	cutoff := now.AddDate(0, 0, -models.DigitalProductLifetimeDays)
+
+	// Expire products with explicit expires_at that has passed
+	r1 := s.db.Model(&models.DigitalProduct{}).
+		Where("is_published = true AND expires_at IS NOT NULL AND expires_at < ?", now).
+		Update("is_published", false)
+	if r1.Error != nil {
+		return 0, r1.Error
+	}
+
+	// Also catch legacy products without expires_at that are older than 180 days
+	r2 := s.db.Model(&models.DigitalProduct{}).
+		Where("is_published = true AND expires_at IS NULL AND created_at < ?", cutoff).
+		Updates(map[string]interface{}{
+			"is_published": false,
+			"expires_at":   cutoff,
+		})
+
+	return r1.RowsAffected + r2.RowsAffected, r2.Error
+}
+
 // ─── Purchase ─────────────────────────────────────────────────────────────────
 
-// CompletePurchase is called after Paystack/Flutterwave confirms payment.
-// Creates a DigitalOrder, sends the signed download link to the buyer.
+// CompletePurchase is called after Paystack/Flutterwave confirms payment via webhook.
 func (s *Service) CompletePurchase(productID uuid.UUID, req PurchaseRequest) (*models.DigitalOrder, error) {
 	var p models.DigitalProduct
 	if err := s.db.Preload("Business").First(&p, productID).Error; err != nil {
@@ -214,7 +299,7 @@ func (s *Service) CompletePurchase(productID uuid.UUID, req PurchaseRequest) (*m
 		BuyerEmail:       req.BuyerEmail,
 		AmountPaid:       p.Price,
 		Currency:         p.Currency,
-		PaymentChannel:   req.Channel, // "paystack" | "flutterwave"
+		PaymentChannel:   req.Channel,
 		PaymentReference: &req.Reference,
 		PaymentStatus:    models.OrderPaymentStatusSuccessful,
 		PaidAt:           &now,
@@ -223,9 +308,8 @@ func (s *Service) CompletePurchase(productID uuid.UUID, req PurchaseRequest) (*m
 		AccessExpiresAt:  &accessExpiry,
 		PayoutStatus:     models.PayoutStatusPending,
 	}
-	order.CalculateFees() // sets PlatformFee and OwnerPayoutAmount from AmountPaid
+	order.CalculateFees()
 
-	// Build signed download URL to email (not stored — generated fresh each time)
 	var downloadURL string
 	if p.FileURL != nil {
 		downloadURL = s.imagekitClient.GetSignedURL(imagekit.SignedURLOptions{
@@ -246,7 +330,6 @@ func (s *Service) CompletePurchase(productID uuid.UUID, req PurchaseRequest) (*m
 		return nil, err
 	}
 
-	// Email the signed download link to the buyer
 	if downloadURL != "" {
 		email.SendDigitalProductAccess(
 			req.BuyerEmail,
@@ -261,7 +344,6 @@ func (s *Service) CompletePurchase(productID uuid.UUID, req PurchaseRequest) (*m
 }
 
 // GetDownloadURL returns a fresh signed URL for an existing order.
-// Called when the buyer requests a re-download.
 func (s *Service) GetDownloadURL(orderID uuid.UUID, buyerEmail string) (string, error) {
 	var order models.DigitalOrder
 	if err := s.db.Where("id = ? AND buyer_email = ?", orderID, buyerEmail).
@@ -278,6 +360,25 @@ func (s *Service) GetDownloadURL(orderID uuid.UUID, buyerEmail string) (string, 
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+func parseGallery(raw string) []string {
+	if raw == "" || raw == "null" {
+		return []string{}
+	}
+	var urls []string
+	if err := json.Unmarshal([]byte(raw), &urls); err != nil {
+		return []string{}
+	}
+	return urls
+}
+
+func marshalGallery(urls []string) string {
+	if urls == nil {
+		urls = []string{}
+	}
+	b, _ := json.Marshal(urls)
+	return string(b)
+}
 
 func (s *Service) generateSlug(title string) string {
 	slug := strings.Map(func(r rune) rune {

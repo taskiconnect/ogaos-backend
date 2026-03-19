@@ -42,10 +42,13 @@ func SetupAuthRoutes(
 	digitalHandler *digital.Handler,
 	webhookHandler *webhook.Handler,
 ) {
+	// ── Global ────────────────────────────────────────────────────────────────
 	r.Use(middleware.CORSMiddleware(cfg.AllowedOrigins))
 
+	// ── Health ────────────────────────────────────────────────────────────────
 	r.GET("/health", healthHandler.Check)
 
+	// ── Webhooks (raw body, no JWT) ───────────────────────────────────────────
 	webhooks := r.Group("/webhooks")
 	{
 		webhooks.POST("/paystack", webhookHandler.Paystack)
@@ -54,6 +57,7 @@ func SetupAuthRoutes(
 
 	v1 := r.Group("/api/v1")
 
+	// ── Auth (public) ─────────────────────────────────────────────────────────
 	authGroup := v1.Group("/auth")
 	{
 		authGroup.POST("/register", authHandler.Register)
@@ -63,30 +67,41 @@ func SetupAuthRoutes(
 		authGroup.GET("/verify", authHandler.VerifyEmail)
 	}
 
+	// ── Location (public) ─────────────────────────────────────────────────────
 	locGroup := v1.Group("/locations")
 	{
 		locGroup.GET("/states", locationHandler.GetStates)
 		locGroup.GET("/lgas", locationHandler.GetLGAs)
 	}
 
+	// ── Public storefront & jobs (no JWT) ─────────────────────────────────────
 	public := v1.Group("/public")
 	{
+		// Business profile
 		public.GET("/business/:slug", businessHandler.GetPublicProfile)
 
+		// All published digital products for a business (used by storefront page)
+		public.GET("/business/:slug/products", digitalHandler.ListPublicProducts)
+
+		// Jobs / recruitment
 		public.GET("/jobs/:slug", recruitmentHandler.GetPublicJob)
 		public.POST("/jobs/:id/apply", recruitmentHandler.Apply)
 		public.POST("/assessment/:app_id/submit", recruitmentHandler.SubmitAssessment)
 
+		// Digital product store
 		public.GET("/store/:slug", digitalHandler.GetPublicProduct)
 		public.POST("/store/:id/purchase", digitalHandler.Purchase)
 		public.GET("/orders/:order_id/download", digitalHandler.GetDownload)
 	}
 
+	// ── Protected (JWT required for everything below) ─────────────────────────
 	protected := v1.Group("")
 	protected.Use(middleware.AuthMiddleware([]byte(cfg.JWTSecret)))
 
+	// Auth — me
 	protected.GET("/auth/me", authHandler.WhoAmI)
 
+	// ── Business ──────────────────────────────────────────────────────────────
 	biz := protected.Group("/business")
 	biz.Use(middleware.RequireRole(middleware.RoleOwner))
 	{
@@ -94,17 +109,24 @@ func SetupAuthRoutes(
 		biz.PATCH("/me", businessHandler.Update)
 		biz.POST("/me/logo", businessHandler.UploadLogo)
 		biz.PATCH("/me/visibility", businessHandler.SetVisibility)
+
+		// Storefront gallery — up to 3 photos
+		biz.POST("/me/gallery", businessHandler.AddGalleryImage)
+		biz.DELETE("/me/gallery/:index", businessHandler.RemoveGalleryImage)
+
+		// Storefront promo video link
+		biz.PATCH("/me/storefront-video", businessHandler.SetStorefrontVideo)
 	}
 
-	// -- Staff --------------------------------------------------------------
+	// ── Staff ─────────────────────────────────────────────────────────────────
 	staff := protected.Group("/staff")
 	staff.Use(middleware.RequireRole(middleware.RoleOwner))
 	{
-		staff.GET("", authHandler.ListStaff) // - NEW: returns staff list
 		staff.POST("", authHandler.CreateStaff)
 		staff.DELETE("/:id", authHandler.DeactivateStaff)
 	}
 
+	// ── Stores ────────────────────────────────────────────────────────────────
 	stores := protected.Group("/stores")
 	stores.Use(middleware.SubscriptionGuard(db, "stores"))
 	{
@@ -116,6 +138,7 @@ func SetupAuthRoutes(
 		stores.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), storeHandler.Delete)
 	}
 
+	// ── Customers ─────────────────────────────────────────────────────────────
 	customers := protected.Group("/customers")
 	{
 		customers.POST("", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), middleware.LimitGuard(db, "customers"), customerHandler.Create)
@@ -125,6 +148,7 @@ func SetupAuthRoutes(
 		customers.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), customerHandler.Delete)
 	}
 
+	// ── Products ──────────────────────────────────────────────────────────────
 	products := protected.Group("/products")
 	{
 		products.POST("", middleware.RequireRole(middleware.RoleOwner), middleware.LimitGuard(db, "products"), productHandler.Create)
@@ -136,6 +160,7 @@ func SetupAuthRoutes(
 		products.POST("/:id/image", middleware.RequireRole(middleware.RoleOwner), productHandler.UploadImage)
 	}
 
+	// ── Sales ─────────────────────────────────────────────────────────────────
 	sales := protected.Group("/sales")
 	{
 		sales.POST("", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.Create)
@@ -144,6 +169,7 @@ func SetupAuthRoutes(
 		sales.POST("/:id/receipt", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.GenerateReceipt)
 	}
 
+	// ── Invoices ──────────────────────────────────────────────────────────────
 	invoices := protected.Group("/invoices")
 	invoices.Use(middleware.SubscriptionGuard(db, "invoices"))
 	{
@@ -155,6 +181,7 @@ func SetupAuthRoutes(
 		invoices.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.Cancel)
 	}
 
+	// ── Expenses ──────────────────────────────────────────────────────────────
 	expenses := protected.Group("/expenses")
 	expenses.Use(middleware.SubscriptionGuard(db, "expense_tracking"))
 	{
@@ -166,6 +193,7 @@ func SetupAuthRoutes(
 		expenses.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), expenseHandler.Delete)
 	}
 
+	// ── Debts ─────────────────────────────────────────────────────────────────
 	debts := protected.Group("/debts")
 	debts.Use(middleware.SubscriptionGuard(db, "debt_tracking"))
 	{
@@ -175,6 +203,7 @@ func SetupAuthRoutes(
 		debts.POST("/:id/payment", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), debtHandler.RecordPayment)
 	}
 
+	// ── Recruitment ───────────────────────────────────────────────────────────
 	recruit := protected.Group("")
 	recruit.Use(middleware.SubscriptionGuard(db, "recruitment"))
 	{
@@ -189,6 +218,7 @@ func SetupAuthRoutes(
 		apps.PATCH("/:id/review", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), recruitmentHandler.ReviewApplication)
 	}
 
+	// ── Digital products ──────────────────────────────────────────────────────
 	dp := protected.Group("/digital-products")
 	{
 		dp.POST("", middleware.RequireRole(middleware.RoleOwner), digitalHandler.Create)
@@ -198,5 +228,9 @@ func SetupAuthRoutes(
 		dp.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), digitalHandler.Delete)
 		dp.POST("/:id/file", middleware.RequireRole(middleware.RoleOwner), digitalHandler.UploadFile)
 		dp.POST("/:id/cover", middleware.RequireRole(middleware.RoleOwner), digitalHandler.UploadCover)
+
+		// Gallery — up to 3 images per product
+		dp.POST("/:id/gallery", middleware.RequireRole(middleware.RoleOwner), digitalHandler.AddGalleryImage)
+		dp.DELETE("/:id/gallery/:index", middleware.RequireRole(middleware.RoleOwner), digitalHandler.RemoveGalleryImage)
 	}
 }

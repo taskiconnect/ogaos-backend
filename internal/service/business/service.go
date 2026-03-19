@@ -2,6 +2,7 @@
 package business
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"unicode"
@@ -20,7 +21,7 @@ func NewService(db *gorm.DB) *Service {
 	return &Service{db: db}
 }
 
-// ─── DTOs ────────────────────────────────────────────────────────────────────
+// ─── DTOs ─────────────────────────────────────────────────────────────────────
 
 type UpdateBusinessRequest struct {
 	Name            *string `json:"name"`
@@ -34,7 +35,7 @@ type UpdateBusinessRequest struct {
 	Country         *string `json:"country"`
 }
 
-// ─── Methods ─────────────────────────────────────────────────────────────────
+// ─── Core methods ─────────────────────────────────────────────────────────────
 
 // Get returns the business profile for the given businessID.
 func (s *Service) Get(businessID uuid.UUID) (*models.Business, error) {
@@ -88,7 +89,7 @@ func (s *Service) Update(businessID uuid.UUID, req UpdateBusinessRequest) (*mode
 	return &b, nil
 }
 
-// UpdateLogo sets the logo_url after upload service stores the file in ImageKit.
+// UpdateLogo sets the logo_url after the upload service stores the file in ImageKit.
 func (s *Service) UpdateLogo(businessID uuid.UUID, logoURL string) error {
 	return s.db.Model(&models.Business{}).
 		Where("id = ?", businessID).
@@ -113,7 +114,90 @@ func (s *Service) GetPublicProfile(slug string) (*models.Business, error) {
 	return &b, nil
 }
 
+// ─── Storefront gallery ───────────────────────────────────────────────────────
+
+// AddGalleryImage adds an image URL to the business storefront gallery (max 3).
+// Returns the updated business.
+func (s *Service) AddGalleryImage(businessID uuid.UUID, imageURL string) (*models.Business, error) {
+	var b models.Business
+	if err := s.db.Where("id = ?", businessID).First(&b).Error; err != nil {
+		return nil, errors.New("business not found")
+	}
+	gallery := parseGallery(b.GalleryImageURLs)
+	if len(gallery) >= 3 {
+		return nil, errors.New("maximum 3 gallery images allowed per storefront")
+	}
+	gallery = append(gallery, imageURL)
+	if err := s.db.Model(&b).Update("gallery_image_urls", marshalGallery(gallery)).Error; err != nil {
+		return nil, err
+	}
+	b.GalleryImageURLs = marshalGallery(gallery)
+	return &b, nil
+}
+
+// RemoveGalleryImage removes a gallery image at the given zero-based index.
+// Returns the updated business.
+func (s *Service) RemoveGalleryImage(businessID uuid.UUID, index int) (*models.Business, error) {
+	var b models.Business
+	if err := s.db.Where("id = ?", businessID).First(&b).Error; err != nil {
+		return nil, errors.New("business not found")
+	}
+	gallery := parseGallery(b.GalleryImageURLs)
+	if index < 0 || index >= len(gallery) {
+		return nil, errors.New("invalid gallery index")
+	}
+	gallery = append(gallery[:index], gallery[index+1:]...)
+	if err := s.db.Model(&b).Update("gallery_image_urls", marshalGallery(gallery)).Error; err != nil {
+		return nil, err
+	}
+	b.GalleryImageURLs = marshalGallery(gallery)
+	return &b, nil
+}
+
+// SetStorefrontVideo sets or clears the business storefront promo video URL.
+// Pass an empty string to clear the video.
+func (s *Service) SetStorefrontVideo(businessID uuid.UUID, videoURL string) (*models.Business, error) {
+	var b models.Business
+	if err := s.db.Where("id = ?", businessID).First(&b).Error; err != nil {
+		return nil, errors.New("business not found")
+	}
+	var val interface{}
+	if videoURL == "" {
+		val = nil
+	} else {
+		val = videoURL
+	}
+	if err := s.db.Model(&b).Update("storefront_video_url", val).Error; err != nil {
+		return nil, err
+	}
+	if videoURL == "" {
+		b.StorefrontVideoURL = nil
+	} else {
+		b.StorefrontVideoURL = &videoURL
+	}
+	return &b, nil
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+func parseGallery(raw string) []string {
+	if raw == "" || raw == "null" {
+		return []string{}
+	}
+	var urls []string
+	if err := json.Unmarshal([]byte(raw), &urls); err != nil {
+		return []string{}
+	}
+	return urls
+}
+
+func marshalGallery(urls []string) string {
+	if urls == nil {
+		urls = []string{}
+	}
+	b, _ := json.Marshal(urls)
+	return string(b)
+}
 
 func generateSlug(name string) string {
 	slug := strings.Map(func(r rune) rune {
@@ -122,7 +206,6 @@ func generateSlug(name string) string {
 		}
 		return '-'
 	}, name)
-	// Collapse multiple dashes
 	for strings.Contains(slug, "--") {
 		slug = strings.ReplaceAll(slug, "--", "-")
 	}
