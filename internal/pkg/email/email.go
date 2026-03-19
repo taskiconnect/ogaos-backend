@@ -69,7 +69,7 @@ func send(to, subject, html string) error {
 
 // SendVerificationEmail sends an account verification email to a new business owner.
 func SendVerificationEmail(to, token, frontendURL, businessName string) {
-	link := fmt.Sprintf("%s/verify?token=%s", frontendURL, token)
+	link := fmt.Sprintf("%s/auth/verify?token=%s", frontendURL, token)
 	html := fmt.Sprintf(`
 		<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
 			<h2>Welcome to OgaOs, %s!</h2>
