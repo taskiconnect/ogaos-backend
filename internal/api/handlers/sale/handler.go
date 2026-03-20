@@ -2,6 +2,8 @@
 package sale
 
 import (
+	"strconv"
+
 	"github.com/gin-gonic/gin"
 
 	"ogaos-backend/internal/api/handlers/shared"
@@ -30,21 +32,30 @@ func (h *Handler) Create(c *gin.Context) {
 
 // GET /sales
 func (h *Handler) List(c *gin.Context) {
-	cur, limit := shared.CursorParams(c)
-	sales, nextCursor, err := h.service.List(shared.MustBusinessID(c), svcSale.ListFilter{
+	limit := queryInt(c, "limit", 20)
+	page := queryInt(c, "page", 1)
+	sales, total, err := h.service.List(shared.MustBusinessID(c), svcSale.ListFilter{
 		StoreID:    shared.QueryUUID(c, "store_id"),
 		CustomerID: shared.QueryUUID(c, "customer_id"),
 		Status:     c.Query("status"),
 		DateFrom:   shared.QueryTime(c, "date_from"),
 		DateTo:     shared.QueryTime(c, "date_to"),
-		Cursor:     cur,
+		Page:       page,
 		Limit:      limit,
 	})
 	if err != nil {
 		response.InternalError(c, err.Error())
 		return
 	}
-	response.CursorList(c, sales, nextCursor)
+	c.JSON(200, gin.H{
+		"success": true,
+		"data":    sales,
+		"meta": gin.H{
+			"total": total,
+			"page":  page,
+			"limit": limit,
+		},
+	})
 }
 
 // GET /sales/:id
@@ -73,4 +84,39 @@ func (h *Handler) GenerateReceipt(c *gin.Context) {
 		return
 	}
 	response.OK(c, sale)
+}
+
+// POST /sales/:id/payment
+// Body: { "amount": <kobo>, "payment_method": "cash|transfer|...", "note": "optional" }
+// Supports installments — call multiple times until balance_due reaches 0.
+func (h *Handler) RecordPayment(c *gin.Context) {
+	id, ok := shared.ParseID(c, "id")
+	if !ok {
+		return
+	}
+	var req svcSale.RecordPaymentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	sale, err := h.service.RecordPayment(shared.MustBusinessID(c), id, shared.MustUserID(c), req)
+	if err != nil {
+		response.Err(c, err)
+		return
+	}
+	response.OK(c, sale)
+}
+
+// ─── private helpers ──────────────────────────────────────────────────────────
+
+func queryInt(c *gin.Context, key string, fallback int) int {
+	s := c.Query(key)
+	if s == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 {
+		return fallback
+	}
+	return n
 }

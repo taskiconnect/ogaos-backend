@@ -21,18 +21,46 @@ func NewService(client *imagekit.Client) *Service {
 	return &Service{client: client}
 }
 
-// ─── Folders ──────────────────────────────────────────────────────────────────
+// ─── Folder helpers ───────────────────────────────────────────────────────────
+//
+// All files are stored under the root "ogaos/" namespace in ImageKit.
+// Per-business and per-product sub-folders keep everything organised
+// and make it easy to find or delete all assets for a specific entity.
+//
+// Structure:
+//   ogaos/businesses/{businessID}/logo/
+//   ogaos/businesses/{businessID}/gallery/
+//   ogaos/products/{productID}/cover/
+//   ogaos/products/{productID}/gallery/
+//   ogaos/products/{productID}/file/       ← private
+//   ogaos/applications/{applicationID}/cv/ ← private
+//   ogaos/receipts/
 
-const (
-	FolderLogos           = "logos"
-	FolderProductImages   = "products"
-	FolderDigitalFiles    = "digital-products"
-	FolderCoverImages     = "covers"
-	FolderReceiptPDFs     = "documents"
-	FolderCVs             = "cvs"
-	FolderProductGallery  = "product-gallery"
-	FolderBusinessGallery = "business-gallery"
-)
+const root = "ogaos"
+
+func bizLogoFolder(businessID uuid.UUID) string {
+	return fmt.Sprintf("%s/businesses/%s/logo", root, businessID.String())
+}
+func bizGalleryFolder(businessID uuid.UUID) string {
+	return fmt.Sprintf("%s/businesses/%s/gallery", root, businessID.String())
+}
+func productCoverFolder(productID uuid.UUID) string {
+	return fmt.Sprintf("%s/products/%s/cover", root, productID.String())
+}
+func productGalleryFolder(productID uuid.UUID) string {
+	return fmt.Sprintf("%s/products/%s/gallery", root, productID.String())
+}
+func productFileFolder(productID uuid.UUID) string {
+	return fmt.Sprintf("%s/products/%s/file", root, productID.String())
+}
+func physicalProductImageFolder(productID uuid.UUID) string {
+	return fmt.Sprintf("%s/products/%s/image", root, productID.String())
+}
+func cvFolder(applicationID uuid.UUID) string {
+	return fmt.Sprintf("%s/applications/%s/cv", root, applicationID.String())
+}
+
+const receiptFolder = root + "/receipts"
 
 // ─── Result ───────────────────────────────────────────────────────────────────
 
@@ -43,19 +71,20 @@ type UploadResult struct {
 	MimeType string
 }
 
-// ─── Methods ─────────────────────────────────────────────────────────────────
+// ─── Business uploads ─────────────────────────────────────────────────────────
 
-// UploadLogo uploads a business logo as a public image.
+// UploadLogo uploads the business logo.
+// Stored at: ogaos/businesses/{businessID}/logo/logo{ext}
 func (s *Service) UploadLogo(businessID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
 	ext := safeExt(originalName)
 	if !isImageExt(ext) {
 		return nil, errors.New("logo must be an image file (jpg, png, webp)")
 	}
-	fileName := fmt.Sprintf("logo-%s%s", businessID.String(), ext)
+	fileName := fmt.Sprintf("logo%s", ext)
 	resp, err := s.client.Upload(imagekit.UploadRequest{
 		File:      data,
 		FileName:  fileName,
-		Folder:    FolderLogos,
+		Folder:    bizLogoFolder(businessID),
 		IsPrivate: false,
 	})
 	if err != nil {
@@ -64,17 +93,40 @@ func (s *Service) UploadLogo(businessID uuid.UUID, data []byte, originalName str
 	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
 }
 
-// UploadProductImage uploads a physical product image as a public image.
+// UploadBusinessGalleryImage uploads one storefront gallery photo (max 3).
+// Stored at: ogaos/businesses/{businessID}/gallery/gallery-{timestamp}{ext}
+func (s *Service) UploadBusinessGalleryImage(businessID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
+	ext := safeExt(originalName)
+	if !isImageExt(ext) {
+		return nil, errors.New("gallery image must be jpg, png, or webp")
+	}
+	fileName := fmt.Sprintf("gallery-%d%s", time.Now().UnixMilli(), ext)
+	resp, err := s.client.Upload(imagekit.UploadRequest{
+		File:      data,
+		FileName:  fileName,
+		Folder:    bizGalleryFolder(businessID),
+		IsPrivate: false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("business gallery upload failed: %w", err)
+	}
+	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
+}
+
+// ─── Physical product uploads ─────────────────────────────────────────────────
+
+// UploadProductImage uploads a physical (inventory) product image.
+// Stored at: ogaos/products/{productID}/image/image-{timestamp}{ext}
 func (s *Service) UploadProductImage(productID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
 	ext := safeExt(originalName)
 	if !isImageExt(ext) {
 		return nil, errors.New("product image must be an image file (jpg, png, webp)")
 	}
-	fileName := fmt.Sprintf("product-%s-%d%s", productID.String()[:8], time.Now().UnixMilli(), ext)
+	fileName := fmt.Sprintf("image-%d%s", time.Now().UnixMilli(), ext)
 	resp, err := s.client.Upload(imagekit.UploadRequest{
 		File:      data,
 		FileName:  fileName,
-		Folder:    FolderProductImages,
+		Folder:    physicalProductImageFolder(productID),
 		IsPrivate: false,
 	})
 	if err != nil {
@@ -83,16 +135,59 @@ func (s *Service) UploadProductImage(productID uuid.UUID, data []byte, originalN
 	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
 }
 
-// UploadDigitalProductFile uploads the private downloadable file for a digital product.
-// Stored as private — access requires a signed URL.
-func (s *Service) UploadDigitalProductFile(productID uuid.UUID, data []byte, originalName, mimeType string) (*UploadResult, error) {
+// ─── Digital product uploads ──────────────────────────────────────────────────
+
+// UploadCoverImage uploads the digital product cover image.
+// Stored at: ogaos/products/{productID}/cover/cover{ext}
+func (s *Service) UploadCoverImage(productID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
 	ext := safeExt(originalName)
-	fileName := fmt.Sprintf("dp-%s-%d%s", productID.String()[:8], time.Now().UnixMilli(), ext)
+	if !isImageExt(ext) {
+		return nil, errors.New("cover image must be an image file (jpg, png, webp)")
+	}
+	fileName := fmt.Sprintf("cover%s", ext)
 	resp, err := s.client.Upload(imagekit.UploadRequest{
 		File:      data,
 		FileName:  fileName,
-		Folder:    FolderDigitalFiles,
-		IsPrivate: true,
+		Folder:    productCoverFolder(productID),
+		IsPrivate: false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cover image upload failed: %w", err)
+	}
+	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
+}
+
+// UploadProductGalleryImage uploads one of up to 3 digital product gallery images.
+// Stored at: ogaos/products/{productID}/gallery/gallery-{timestamp}{ext}
+func (s *Service) UploadProductGalleryImage(productID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
+	ext := safeExt(originalName)
+	if !isImageExt(ext) {
+		return nil, errors.New("gallery image must be jpg, png, or webp")
+	}
+	fileName := fmt.Sprintf("gallery-%d%s", time.Now().UnixMilli(), ext)
+	resp, err := s.client.Upload(imagekit.UploadRequest{
+		File:      data,
+		FileName:  fileName,
+		Folder:    productGalleryFolder(productID),
+		IsPrivate: false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("product gallery upload failed: %w", err)
+	}
+	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
+}
+
+// UploadDigitalProductFile uploads the private downloadable file for a digital product.
+// Stored at: ogaos/products/{productID}/file/{filename}
+// PRIVATE — access requires a signed URL, never expose directly.
+func (s *Service) UploadDigitalProductFile(productID uuid.UUID, data []byte, originalName, mimeType string) (*UploadResult, error) {
+	ext := safeExt(originalName)
+	fileName := fmt.Sprintf("file-%d%s", time.Now().UnixMilli(), ext)
+	resp, err := s.client.Upload(imagekit.UploadRequest{
+		File:      data,
+		FileName:  fileName,
+		Folder:    productFileFolder(productID),
+		IsPrivate: true, // ← critical: signed URL required to access
 	})
 	if err != nil {
 		return nil, fmt.Errorf("digital product file upload failed: %w", err)
@@ -105,74 +200,19 @@ func (s *Service) UploadDigitalProductFile(productID uuid.UUID, data []byte, ori
 	}, nil
 }
 
-// UploadCoverImage uploads a digital product cover image as a public image.
-func (s *Service) UploadCoverImage(productID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
-	ext := safeExt(originalName)
-	if !isImageExt(ext) {
-		return nil, errors.New("cover image must be an image file (jpg, png, webp)")
-	}
-	fileName := fmt.Sprintf("cover-%s-%d%s", productID.String()[:8], time.Now().UnixMilli(), ext)
-	resp, err := s.client.Upload(imagekit.UploadRequest{
-		File:      data,
-		FileName:  fileName,
-		Folder:    FolderCoverImages,
-		IsPrivate: false,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("cover image upload failed: %w", err)
-	}
-	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
-}
+// ─── Other uploads ────────────────────────────────────────────────────────────
 
-// UploadProductGalleryImage uploads one of up to 3 gallery images for a digital product.
-func (s *Service) UploadProductGalleryImage(productID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
-	ext := safeExt(originalName)
-	if !isImageExt(ext) {
-		return nil, errors.New("gallery image must be jpg, png, or webp")
-	}
-	fileName := fmt.Sprintf("prod-gallery-%s-%d%s", productID.String()[:8], time.Now().UnixMilli(), ext)
-	resp, err := s.client.Upload(imagekit.UploadRequest{
-		File:      data,
-		FileName:  fileName,
-		Folder:    FolderProductGallery,
-		IsPrivate: false,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("product gallery upload failed: %w", err)
-	}
-	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
-}
-
-// UploadBusinessGalleryImage uploads one of up to 3 storefront gallery images for a business.
-func (s *Service) UploadBusinessGalleryImage(businessID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
-	ext := safeExt(originalName)
-	if !isImageExt(ext) {
-		return nil, errors.New("gallery image must be jpg, png, or webp")
-	}
-	fileName := fmt.Sprintf("biz-gallery-%s-%d%s", businessID.String()[:8], time.Now().UnixMilli(), ext)
-	resp, err := s.client.Upload(imagekit.UploadRequest{
-		File:      data,
-		FileName:  fileName,
-		Folder:    FolderBusinessGallery,
-		IsPrivate: false,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("business gallery upload failed: %w", err)
-	}
-	return &UploadResult{URL: resp.URL, FileID: resp.FileID, FileSize: int64(resp.Size)}, nil
-}
-
-// UploadCV uploads a job applicant's CV. Stored as private.
+// UploadCV uploads a job applicant's CV as a private PDF.
+// Stored at: ogaos/applications/{applicationID}/cv/cv.pdf
 func (s *Service) UploadCV(applicationID uuid.UUID, data []byte, originalName string) (*UploadResult, error) {
 	ext := safeExt(originalName)
 	if ext != ".pdf" {
 		return nil, errors.New("CV must be a PDF file")
 	}
-	fileName := fmt.Sprintf("cv-%s%s", applicationID.String()[:8], ext)
 	resp, err := s.client.Upload(imagekit.UploadRequest{
 		File:      data,
-		FileName:  fileName,
-		Folder:    FolderCVs,
+		FileName:  "cv.pdf",
+		Folder:    cvFolder(applicationID),
 		IsPrivate: true,
 	})
 	if err != nil {

@@ -77,18 +77,13 @@ func SetupAuthRoutes(
 	// ── Public storefront & jobs (no JWT) ─────────────────────────────────────
 	public := v1.Group("/public")
 	{
-		// Business profile
 		public.GET("/business/:slug", businessHandler.GetPublicProfile)
-
-		// All published digital products for a business (used by storefront page)
 		public.GET("/business/:slug/products", digitalHandler.ListPublicProducts)
 
-		// Jobs / recruitment
 		public.GET("/jobs/:slug", recruitmentHandler.GetPublicJob)
 		public.POST("/jobs/:id/apply", recruitmentHandler.Apply)
 		public.POST("/assessment/:app_id/submit", recruitmentHandler.SubmitAssessment)
 
-		// Digital product store
 		public.GET("/store/:slug", digitalHandler.GetPublicProduct)
 		public.POST("/store/:id/purchase", digitalHandler.Purchase)
 		public.GET("/orders/:order_id/download", digitalHandler.GetDownload)
@@ -98,7 +93,6 @@ func SetupAuthRoutes(
 	protected := v1.Group("")
 	protected.Use(middleware.AuthMiddleware([]byte(cfg.JWTSecret)))
 
-	// Auth — me
 	protected.GET("/auth/me", authHandler.WhoAmI)
 
 	// ── Business ──────────────────────────────────────────────────────────────
@@ -109,12 +103,8 @@ func SetupAuthRoutes(
 		biz.PATCH("/me", businessHandler.Update)
 		biz.POST("/me/logo", businessHandler.UploadLogo)
 		biz.PATCH("/me/visibility", businessHandler.SetVisibility)
-
-		// Storefront gallery — up to 3 photos
 		biz.POST("/me/gallery", businessHandler.AddGalleryImage)
 		biz.DELETE("/me/gallery/:index", businessHandler.RemoveGalleryImage)
-
-		// Storefront promo video link
 		biz.PATCH("/me/storefront-video", businessHandler.SetStorefrontVideo)
 	}
 
@@ -167,6 +157,7 @@ func SetupAuthRoutes(
 		sales.GET("", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.List)
 		sales.GET("/:id", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.Get)
 		sales.POST("/:id/receipt", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.GenerateReceipt)
+		sales.POST("/:id/payment", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.RecordPayment)
 	}
 
 	// ── Invoices ──────────────────────────────────────────────────────────────
@@ -228,8 +219,6 @@ func SetupAuthRoutes(
 		dp.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), digitalHandler.Delete)
 		dp.POST("/:id/file", middleware.RequireRole(middleware.RoleOwner), digitalHandler.UploadFile)
 		dp.POST("/:id/cover", middleware.RequireRole(middleware.RoleOwner), digitalHandler.UploadCover)
-
-		// Gallery — up to 3 images per product
 		dp.POST("/:id/gallery", middleware.RequireRole(middleware.RoleOwner), digitalHandler.AddGalleryImage)
 		dp.DELETE("/:id/gallery/:index", middleware.RequireRole(middleware.RoleOwner), digitalHandler.RemoveGalleryImage)
 	}
