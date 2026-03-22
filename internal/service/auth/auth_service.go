@@ -19,6 +19,8 @@ import (
 	"ogaos-backend/internal/pkg/jwtpkg"
 )
 
+// ─── Slug helpers ─────────────────────────────────────────────────────────────
+
 // generateSlug converts a business name into a lowercase URL-safe slug.
 func generateSlug(name string) string {
 	slug := strings.Map(func(r rune) rune {
@@ -33,7 +35,8 @@ func generateSlug(name string) string {
 	return strings.Trim(slug, "-")
 }
 
-// uniqueSlug returns a collision-free slug by appending a random suffix if needed.
+// uniqueSlug returns a collision-free slug, appending a random 4-char suffix
+// if the base slug already exists in the database.
 func (s *AuthService) uniqueSlug(tx *gorm.DB, name string) string {
 	base := generateSlug(name)
 	slug := base
@@ -49,6 +52,8 @@ func (s *AuthService) uniqueSlug(tx *gorm.DB, name string) string {
 	}
 	return slug
 }
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 type RegisterRequest struct {
 	FirstName        string `json:"first_name"`
@@ -116,14 +121,19 @@ type Handler struct{ service *AuthService }
 
 func NewHandler(service *AuthService) *Handler { return &Handler{service: service} }
 
+// ─── Register ─────────────────────────────────────────────────────────────────
+
 // Register handles two scenarios:
 // A) New person: create User + Business + BusinessUser(owner)
 // B) Existing staff/owner registering a new business: verify password, create Business + BusinessUser(owner)
 func (s *AuthService) Register(req RegisterRequest) error {
+	// Normalise email to lowercase so lookups are always case-insensitive
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
 	var existingUser models.User
 	found := false
 
-	if s.db.Where("email = ?", req.Email).First(&existingUser).Error == nil {
+	if s.db.Where("LOWER(email) = ?", req.Email).First(&existingUser).Error == nil {
 		found = true
 	} else if s.db.Where("phone_number = ?", req.PhoneNumber).First(&existingUser).Error == nil {
 		found = true
@@ -138,11 +148,15 @@ func (s *AuthService) Register(req RegisterRequest) error {
 		// Same person — create a new business and make them owner
 		return s.db.Transaction(func(tx *gorm.DB) error {
 			business := models.Business{
-				Name: req.BusinessName, Slug: s.uniqueSlug(tx, req.BusinessName),
-				Category: req.BusinessCategory,
-				Street:   req.Street, CityTown: req.CityTown,
-				LocalGovernment: req.LocalGovernment, State: req.State,
-				Country: req.Country, ReferralCodeUsed: req.ReferralCode,
+				Name:             req.BusinessName,
+				Slug:             s.uniqueSlug(tx, req.BusinessName),
+				Category:         req.BusinessCategory,
+				Street:           req.Street,
+				CityTown:         req.CityTown,
+				LocalGovernment:  req.LocalGovernment,
+				State:            req.State,
+				Country:          req.Country,
+				ReferralCodeUsed: req.ReferralCode,
 			}
 			if err := tx.Create(&business).Error; err != nil {
 				return err
@@ -156,7 +170,7 @@ func (s *AuthService) Register(req RegisterRequest) error {
 		})
 	}
 
-	// New person
+	// New person — store email in lowercase for consistency
 	hashed, err := crypto.HashPassword(req.Password)
 	if err != nil {
 		return err
@@ -164,9 +178,13 @@ func (s *AuthService) Register(req RegisterRequest) error {
 	token := uuid.NewString()
 	expiresAt := time.Now().Add(48 * time.Hour)
 	user := models.User{
-		FirstName: req.FirstName, LastName: req.LastName,
-		Email: req.Email, PhoneNumber: req.PhoneNumber,
-		PasswordHash: hashed, VerificationToken: &token, VerificationExpiresAt: &expiresAt,
+		FirstName:             req.FirstName,
+		LastName:              req.LastName,
+		Email:                 req.Email, // already lowercased above
+		PhoneNumber:           req.PhoneNumber,
+		PasswordHash:          hashed,
+		VerificationToken:     &token,
+		VerificationExpiresAt: &expiresAt,
 	}
 
 	return s.db.Transaction(func(tx *gorm.DB) error {
@@ -174,11 +192,15 @@ func (s *AuthService) Register(req RegisterRequest) error {
 			return err
 		}
 		business := models.Business{
-			Name: req.BusinessName, Slug: s.uniqueSlug(tx, req.BusinessName),
-			Category: req.BusinessCategory,
-			Street:   req.Street, CityTown: req.CityTown,
-			LocalGovernment: req.LocalGovernment, State: req.State,
-			Country: req.Country, ReferralCodeUsed: req.ReferralCode,
+			Name:             req.BusinessName,
+			Slug:             s.uniqueSlug(tx, req.BusinessName),
+			Category:         req.BusinessCategory,
+			Street:           req.Street,
+			CityTown:         req.CityTown,
+			LocalGovernment:  req.LocalGovernment,
+			State:            req.State,
+			Country:          req.Country,
+			ReferralCodeUsed: req.ReferralCode,
 		}
 		if err := tx.Create(&business).Error; err != nil {
 			return err
@@ -191,6 +213,8 @@ func (s *AuthService) Register(req RegisterRequest) error {
 	})
 }
 
+// ─── VerifyEmail ──────────────────────────────────────────────────────────────
+
 func (s *AuthService) VerifyEmail(token string) error {
 	var user models.User
 	if err := s.db.Where("verification_token = ? AND verification_expires_at > NOW()", token).First(&user).Error; err != nil {
@@ -202,9 +226,14 @@ func (s *AuthService) VerifyEmail(token string) error {
 	}).Error
 }
 
+// ─── Login ────────────────────────────────────────────────────────────────────
+
 func (s *AuthService) Login(emailAddr, password string) (accessToken, refreshToken string, err error) {
+	// Normalise to lowercase so "Taskilimited@gmail.com" matches "taskilimited@gmail.com"
+	emailAddr = strings.ToLower(strings.TrimSpace(emailAddr))
+
 	var user models.User
-	if err = s.db.Where("email = ?", emailAddr).First(&user).Error; err == nil {
+	if err = s.db.Where("LOWER(email) = ?", emailAddr).First(&user).Error; err == nil {
 		if user.EmailVerifiedAt == nil {
 			return "", "", errors.New("email not verified — check your inbox")
 		}
@@ -224,7 +253,7 @@ func (s *AuthService) Login(emailAddr, password string) (accessToken, refreshTok
 	}
 
 	var admin models.PlatformAdmin
-	if err = s.db.Where("email = ?", emailAddr).First(&admin).Error; err == nil {
+	if err = s.db.Where("LOWER(email) = ?", emailAddr).First(&admin).Error; err == nil {
 		if !admin.IsActive {
 			return "", "", errors.New("account deactivated")
 		}
@@ -237,6 +266,8 @@ func (s *AuthService) Login(emailAddr, password string) (accessToken, refreshTok
 	}
 	return "", "", errors.New("invalid credentials")
 }
+
+// ─── Token helpers ────────────────────────────────────────────────────────────
 
 func (s *AuthService) createRefreshToken(userID uuid.UUID) string {
 	b := make([]byte, 32)
@@ -279,6 +310,8 @@ func (s *AuthService) Logout(refreshToken string) error {
 	return s.db.Model(&models.RefreshToken{}).Where("token_hash = ?", hash).Update("revoked", true).Error
 }
 
+// ─── WhoAmI ───────────────────────────────────────────────────────────────────
+
 func (s *AuthService) WhoAmI(userID uuid.UUID, isPlatform bool) (*WhoAmIResponse, error) {
 	if isPlatform {
 		var admin models.PlatformAdmin
@@ -314,6 +347,8 @@ func (s *AuthService) WhoAmI(userID uuid.UUID, isPlatform bool) (*WhoAmIResponse
 	return resp, nil
 }
 
+// ─── Staff ────────────────────────────────────────────────────────────────────
+
 // CreateStaff handles two scenarios:
 // A) New person: create User + BusinessUser(staff)
 // B) Existing user: just add BusinessUser(staff) link — no new User created
@@ -329,24 +364,23 @@ func (s *AuthService) CreateStaff(businessID uuid.UUID, req StaffCreateRequest) 
 	var business models.Business
 	s.db.First(&business, businessID)
 
-	// Check if user already exists
+	// Normalise email
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
 	var existingUser models.User
-	found := s.db.Where("email = ?", req.Email).First(&existingUser).Error == nil
+	found := s.db.Where("LOWER(email) = ?", req.Email).First(&existingUser).Error == nil
 	if !found {
 		found = s.db.Where("phone_number = ?", req.PhoneNumber).First(&existingUser).Error == nil
 	}
 
 	if found {
-		// Check if already linked to this business
 		var existing models.BusinessUser
 		if s.db.Where("business_id = ? AND user_id = ?", businessID, existingUser.ID).First(&existing).Error == nil {
 			if existing.IsActive {
 				return errors.New("this person is already a member of your business")
 			}
-			// Re-activate
 			return s.db.Model(&existing).Update("is_active", true).Error
 		}
-		// Link existing user as staff
 		if err := s.db.Create(&models.BusinessUser{BusinessID: businessID, UserID: existingUser.ID, Role: "staff"}).Error; err != nil {
 			return err
 		}
@@ -359,9 +393,13 @@ func (s *AuthService) CreateStaff(businessID uuid.UUID, req StaffCreateRequest) 
 	token := uuid.NewString()
 	expires := time.Now().Add(48 * time.Hour)
 	staff := models.User{
-		FirstName: req.FirstName, LastName: req.LastName,
-		Email: req.Email, PhoneNumber: req.PhoneNumber,
-		PasswordHash: hashed, VerificationToken: &token, VerificationExpiresAt: &expires,
+		FirstName:             req.FirstName,
+		LastName:              req.LastName,
+		Email:                 req.Email, // already lowercased
+		PhoneNumber:           req.PhoneNumber,
+		PasswordHash:          hashed,
+		VerificationToken:     &token,
+		VerificationExpiresAt: &expires,
 	}
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&staff).Error; err != nil {
@@ -425,9 +463,13 @@ func (s *AuthService) ListStaff(businessID uuid.UUID) ([]StaffMember, error) {
 	return members, nil
 }
 
+// ─── ResendVerification ───────────────────────────────────────────────────────
+
 func (s *AuthService) ResendVerification(emailAddr string) error {
+	emailAddr = strings.ToLower(strings.TrimSpace(emailAddr))
+
 	var user models.User
-	if err := s.db.Where("email = ?", emailAddr).First(&user).Error; err != nil {
+	if err := s.db.Where("LOWER(email) = ?", emailAddr).First(&user).Error; err != nil {
 		return errors.New("user not found")
 	}
 	if user.EmailVerifiedAt != nil {
