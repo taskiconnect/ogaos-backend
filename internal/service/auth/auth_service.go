@@ -5,7 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -15,6 +18,37 @@ import (
 	"ogaos-backend/internal/pkg/email"
 	"ogaos-backend/internal/pkg/jwtpkg"
 )
+
+// generateSlug converts a business name into a lowercase URL-safe slug.
+func generateSlug(name string) string {
+	slug := strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return unicode.ToLower(r)
+		}
+		return '-'
+	}, name)
+	for strings.Contains(slug, "--") {
+		slug = strings.ReplaceAll(slug, "--", "-")
+	}
+	return strings.Trim(slug, "-")
+}
+
+// uniqueSlug returns a collision-free slug by appending a random suffix if needed.
+func (s *AuthService) uniqueSlug(tx *gorm.DB, name string) string {
+	base := generateSlug(name)
+	slug := base
+	for i := 0; i < 10; i++ {
+		var count int64
+		tx.Model(&models.Business{}).Where("slug = ?", slug).Count(&count)
+		if count == 0 {
+			return slug
+		}
+		b := make([]byte, 3)
+		rand.Read(b)
+		slug = fmt.Sprintf("%s-%s", base, base64.RawURLEncoding.EncodeToString(b)[:4])
+	}
+	return slug
+}
 
 type RegisterRequest struct {
 	FirstName        string `json:"first_name"`
@@ -104,8 +138,9 @@ func (s *AuthService) Register(req RegisterRequest) error {
 		// Same person — create a new business and make them owner
 		return s.db.Transaction(func(tx *gorm.DB) error {
 			business := models.Business{
-				Name: req.BusinessName, Category: req.BusinessCategory,
-				Street: req.Street, CityTown: req.CityTown,
+				Name: req.BusinessName, Slug: s.uniqueSlug(tx, req.BusinessName),
+				Category: req.BusinessCategory,
+				Street:   req.Street, CityTown: req.CityTown,
 				LocalGovernment: req.LocalGovernment, State: req.State,
 				Country: req.Country, ReferralCodeUsed: req.ReferralCode,
 			}
@@ -139,8 +174,9 @@ func (s *AuthService) Register(req RegisterRequest) error {
 			return err
 		}
 		business := models.Business{
-			Name: req.BusinessName, Category: req.BusinessCategory,
-			Street: req.Street, CityTown: req.CityTown,
+			Name: req.BusinessName, Slug: s.uniqueSlug(tx, req.BusinessName),
+			Category: req.BusinessCategory,
+			Street:   req.Street, CityTown: req.CityTown,
 			LocalGovernment: req.LocalGovernment, State: req.State,
 			Country: req.Country, ReferralCodeUsed: req.ReferralCode,
 		}
