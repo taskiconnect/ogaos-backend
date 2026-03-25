@@ -2,6 +2,7 @@
 package paystack
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha512"
 	"encoding/hex"
@@ -86,6 +87,10 @@ func VerifySignature(r *http.Request, secretKey string) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("paystack webhook: failed to read request body")
 	}
+
+	// Important: Restore the body so it can be read again if needed
+	// (Gin sometimes consumes it, but we read it here safely)
+	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body)) // optional safety
 
 	mac := hmac.New(sha512.New, []byte(secretKey))
 	mac.Write(body)

@@ -1,4 +1,3 @@
-// cmd/api/main.go
 package main
 
 import (
@@ -14,6 +13,7 @@ import (
 
 	handlerAuth "ogaos-backend/internal/api/handlers/auth"
 	handlerBusiness "ogaos-backend/internal/api/handlers/business"
+	handlerCoupon "ogaos-backend/internal/api/handlers/coupon"
 	handlerCustomer "ogaos-backend/internal/api/handlers/customer"
 	handlerDebt "ogaos-backend/internal/api/handlers/debt"
 	handlerDigital "ogaos-backend/internal/api/handlers/digital"
@@ -25,6 +25,7 @@ import (
 	handlerRecruitment "ogaos-backend/internal/api/handlers/recruitment"
 	handlerSale "ogaos-backend/internal/api/handlers/sale"
 	handlerStore "ogaos-backend/internal/api/handlers/store"
+	handlerSubscription "ogaos-backend/internal/api/handlers/subscription"
 	handlerWebhook "ogaos-backend/internal/api/handlers/webhook"
 	"ogaos-backend/internal/api/routes"
 	"ogaos-backend/internal/config"
@@ -33,6 +34,7 @@ import (
 	pkgPaystack "ogaos-backend/internal/external/paystack"
 	svcAuth "ogaos-backend/internal/service/auth"
 	svcBusiness "ogaos-backend/internal/service/business"
+	svcCoupon "ogaos-backend/internal/service/coupon"
 	svcCustomer "ogaos-backend/internal/service/customer"
 	svcDebt "ogaos-backend/internal/service/debt"
 	svcDigital "ogaos-backend/internal/service/digital"
@@ -83,7 +85,11 @@ func main() {
 	storeSvc := svcStore.NewService(db.DB)
 	recruitmentSvc := svcRecruitment.NewService(db.DB, cfg.FrontendURL)
 	digitalSvc := svcDigital.NewService(db.DB, ikClient, cfg.FrontendURL, cfg.PlatformFeePercent)
-	subscriptionSvc := svcSubscription.NewService(db.DB, cfg.FrontendURL)
+
+	// Subscription & Coupon Services
+	couponService := svcCoupon.NewService(db.DB)
+	subscriptionSvc := svcSubscription.NewService(db.DB, cfg.FrontendURL, couponService)
+
 	uploadSvc := svcUpload.NewService(ikClient)
 
 	// ── Background workers ────────────────────────────────────────────────────
@@ -105,6 +111,16 @@ func main() {
 	storeHandler := handlerStore.NewHandler(storeSvc)
 	recruitmentHandler := handlerRecruitment.NewHandler(recruitmentSvc, uploadSvc)
 	digitalHandler := handlerDigital.NewHandler(digitalSvc, uploadSvc)
+
+	// New Handlers
+	couponHandler := handlerCoupon.NewHandler(couponService)
+	subscriptionHandler := handlerSubscription.NewHandler(
+		subscriptionSvc,
+		couponService,
+		paystackClient,
+		cfg.FrontendURL,
+	)
+
 	webhookHandler := handlerWebhook.NewHandler(
 		cfg.PaystackWebhookSecret,
 		cfg.FlutterwaveWebhookHash,
@@ -140,6 +156,8 @@ func main() {
 		recruitmentHandler,
 		digitalHandler,
 		webhookHandler,
+		couponHandler,
+		subscriptionHandler,
 	)
 
 	// Create HTTP server with graceful shutdown
@@ -156,7 +174,7 @@ func main() {
 		}
 	}()
 
-	// Wait for interrupt signal (Ctrl+C / SIGTERM)
+	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit

@@ -1,4 +1,3 @@
-// internal/api/routes/routes.go
 package routes
 
 import (
@@ -7,6 +6,7 @@ import (
 
 	"ogaos-backend/internal/api/handlers/auth"
 	"ogaos-backend/internal/api/handlers/business"
+	"ogaos-backend/internal/api/handlers/coupon"
 	"ogaos-backend/internal/api/handlers/customer"
 	"ogaos-backend/internal/api/handlers/debt"
 	"ogaos-backend/internal/api/handlers/digital"
@@ -18,6 +18,7 @@ import (
 	"ogaos-backend/internal/api/handlers/recruitment"
 	"ogaos-backend/internal/api/handlers/sale"
 	"ogaos-backend/internal/api/handlers/store"
+	"ogaos-backend/internal/api/handlers/subscription"
 	"ogaos-backend/internal/api/handlers/webhook"
 	"ogaos-backend/internal/api/middleware"
 	"ogaos-backend/internal/config"
@@ -41,6 +42,8 @@ func SetupAuthRoutes(
 	recruitmentHandler *recruitment.Handler,
 	digitalHandler *digital.Handler,
 	webhookHandler *webhook.Handler,
+	couponHandler *coupon.Handler,
+	subscriptionHandler *subscription.Handler,
 ) {
 	// ── Global ────────────────────────────────────────────────────────────────
 	r.Use(middleware.CORSMiddleware(cfg.AllowedOrigins))
@@ -78,6 +81,7 @@ func SetupAuthRoutes(
 	public := v1.Group("/public")
 	{
 		public.GET("/business/:slug", businessHandler.GetPublicProfile)
+		public.GET("/business/:slug/keywords", businessHandler.GetPublicKeywords)
 		public.GET("/business/:slug/products", digitalHandler.ListPublicProducts)
 
 		public.GET("/jobs/:slug", recruitmentHandler.GetPublicJob)
@@ -89,7 +93,7 @@ func SetupAuthRoutes(
 		public.GET("/orders/:order_id/download", digitalHandler.GetDownload)
 	}
 
-	// ── Protected (JWT required for everything below) ─────────────────────────
+	// ── Protected (JWT required) ──────────────────────────────────────────────
 	protected := v1.Group("")
 	protected.Use(middleware.AuthMiddleware([]byte(cfg.JWTSecret)))
 
@@ -106,6 +110,8 @@ func SetupAuthRoutes(
 		biz.POST("/me/gallery", businessHandler.AddGalleryImage)
 		biz.DELETE("/me/gallery/:index", businessHandler.RemoveGalleryImage)
 		biz.PATCH("/me/storefront-video", businessHandler.SetStorefrontVideo)
+		biz.GET("/me/keywords", businessHandler.GetKeywords)
+		biz.PUT("/me/keywords", businessHandler.SetKeywords)
 	}
 
 	// ── Staff ─────────────────────────────────────────────────────────────────
@@ -221,5 +227,27 @@ func SetupAuthRoutes(
 		dp.POST("/:id/cover", middleware.RequireRole(middleware.RoleOwner), digitalHandler.UploadCover)
 		dp.POST("/:id/gallery", middleware.RequireRole(middleware.RoleOwner), digitalHandler.AddGalleryImage)
 		dp.DELETE("/:id/gallery/:index", middleware.RequireRole(middleware.RoleOwner), digitalHandler.RemoveGalleryImage)
+	}
+
+	// ── ADMIN: Coupon management ──────────────────────────────────────────────
+	admin := protected.Group("/admin")
+	admin.Use(middleware.RequirePlatformAdmin())
+	{
+		coupons := admin.Group("/coupons")
+		{
+			coupons.POST("", couponHandler.Create)
+			coupons.GET("", couponHandler.List)
+			coupons.GET("/:id", couponHandler.Get)
+			coupons.PATCH("/:id", couponHandler.Update)
+			coupons.DELETE("/:id", couponHandler.Delete)
+		}
+	}
+
+	// ── SUBSCRIPTIONS ─────────────────────────────────────────────────────────
+	subs := protected.Group("/subscriptions")
+	{
+		subs.GET("/me", subscriptionHandler.Get)
+		subs.POST("/validate-coupon", subscriptionHandler.ValidateCoupon)
+		subs.POST("/initiate", subscriptionHandler.Initiate)
 	}
 }
