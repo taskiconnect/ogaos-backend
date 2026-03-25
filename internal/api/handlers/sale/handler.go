@@ -107,6 +107,30 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	response.OK(c, sale)
 }
 
+// PATCH /sales/:id/cancel
+// Body: { "reason": "optional explanation" }
+//
+// Marks the sale as cancelled without deleting it — the record stays visible
+// to the business owner so they can audit who cancelled it and why.
+// All side-effects (stock, customer stats, debt, ledger) are reversed inside
+// a single transaction so nothing is left in an inconsistent state.
+func (h *Handler) Cancel(c *gin.Context) {
+	id, ok := shared.ParseID(c, "id")
+	if !ok {
+		return
+	}
+	var req svcSale.CancelRequest
+	// reason is optional — ignore bind errors
+	_ = c.ShouldBindJSON(&req)
+
+	sale, err := h.service.Cancel(shared.MustBusinessID(c), id, shared.MustUserID(c), req)
+	if err != nil {
+		response.Err(c, err)
+		return
+	}
+	response.OK(c, sale)
+}
+
 // ─── private helpers ──────────────────────────────────────────────────────────
 
 func queryInt(c *gin.Context, key string, fallback int) int {

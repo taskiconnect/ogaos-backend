@@ -164,6 +164,7 @@ func SetupAuthRoutes(
 		sales.GET("/:id", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.Get)
 		sales.POST("/:id/receipt", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.GenerateReceipt)
 		sales.POST("/:id/payment", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.RecordPayment)
+		sales.PATCH("/:id/cancel", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), saleHandler.Cancel) // ← added
 	}
 
 	// ── Invoices ──────────────────────────────────────────────────────────────
@@ -243,7 +244,7 @@ func SetupAuthRoutes(
 		}
 	}
 
-	// ── SUBSCRIPTIONS ─────────────────────────────────────────────────────────
+	// ── Subscriptions ─────────────────────────────────────────────────────────
 	subs := protected.Group("/subscriptions")
 	{
 		subs.GET("/me", subscriptionHandler.Get)
