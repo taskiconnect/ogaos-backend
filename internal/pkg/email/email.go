@@ -287,6 +287,53 @@ func SendSubscriptionExpired(to, ownerName, plan string) {
 	}
 }
 
+// SendAdminOTPEmail sends the OTP code to admin's email
+func SendAdminOTPEmail(to, firstName, otp string) {
+	subject := "Your OgaOs Admin Login Code"
+	html := fmt.Sprintf(`
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2>Admin Login Verification</h2>
+            <p>Hi %s,</p>
+            <p>You've requested to log in to the OgaOs admin panel. Use the code below to complete your login:</p>
+            <div style="background-color: #f3f4f6; padding: 20px; text-align: center; font-size: 32px; letter-spacing: 5px; font-weight: bold; border-radius: 8px; margin: 20px 0;">
+                %s
+            </div>
+            <p>This code will expire in <strong>5 minutes</strong>.</p>
+            <p>If you didn't request this login, please ignore this email and ensure your account is secure.</p>
+            <hr style="margin: 20px 0;">
+            <p style="color: #6b7280; font-size: 12px;">This is an automated message from OgaOs. Please do not reply to this email.</p>
+        </div>
+    `, firstName, otp)
+
+	if err := send(to, subject, html); err != nil {
+		log.Printf("[EMAIL ERROR] SendAdminOTPEmail to %s: %v", to, err)
+	}
+}
+
+// SendAdminPasswordSetupEmail sends password setup link to new admin
+func SendAdminPasswordSetupEmail(to, firstName, token, frontendURL string) {
+	link := fmt.Sprintf("%s/admin/setup-password?token=%s", frontendURL, token)
+	subject := "Set Up Your OgaOs Admin Account"
+	html := fmt.Sprintf(`
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2>Welcome to OgaOs Admin Panel</h2>
+            <p>Hi %s,</p>
+            <p>An admin account has been created for you. Please click the button below to set up your password:</p>
+            <p>
+                <a href="%s" style="background-color:#4F46E5;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;display:inline-block;">Set Up Password</a>
+            </p>
+            <p>Or copy this link into your browser:</p>
+            <p>%s</p>
+            <p>This link will expire in <strong>24 hours</strong>.</p>
+            <p>If you didn't request this, please contact your system administrator.</p>
+        </div>
+    `, firstName, link, link)
+
+	if err := send(to, subject, html); err != nil {
+		log.Printf("[EMAIL ERROR] SendAdminPasswordSetupEmail to %s: %v", to, err)
+	}
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 // formatKobo converts kobo to a display Naira string. e.g. 150000 → ₦1,500.00

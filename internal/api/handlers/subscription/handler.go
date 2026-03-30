@@ -62,17 +62,32 @@ func (h *Handler) Initiate(c *gin.Context) {
 	businessID := shared.MustBusinessID(c)
 	email := c.MustGet("email").(string)
 
+	isPlatform, _ := c.Get("is_platform") // set by AdminAuthMiddleware or similar
+
 	var req struct {
 		Plan         string  `json:"plan" binding:"required"`
 		PeriodMonths int     `json:"period_months" binding:"required,min=1,max=12"`
 		CouponCode   *string `json:"coupon_code"`
+		CustomAmount *int64  `json:"custom_amount"` // for special sales packages
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
 
-	data, err := h.subscriptionService.InitiatePayment(businessID, req.Plan, req.PeriodMonths, req.CouponCode)
+	// Only platform admins/sales can create custom plans
+	if req.Plan == "custom" && isPlatform != true {
+		response.BadRequest(c, "custom plans can only be created by the sales team. Please contact sales.")
+		return
+	}
+
+	data, err := h.subscriptionService.InitiatePayment(
+		businessID,
+		req.Plan,
+		req.PeriodMonths,
+		req.CouponCode,
+		req.CustomAmount,
+	)
 	if err != nil {
 		response.BadRequest(c, err.Error())
 		return

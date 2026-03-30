@@ -1,4 +1,3 @@
-// internal/api/handlers/product/handler.go
 package product
 
 import (
@@ -28,7 +27,10 @@ func (h *Handler) Create(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	p, err := h.service.Create(shared.MustBusinessID(c), req)
+
+	idempotencyKey := c.GetHeader("X-Idempotency-Key")
+
+	p, err := h.service.Create(shared.MustBusinessID(c), req, idempotencyKey)
 	if err != nil {
 		response.Err(c, err)
 		return

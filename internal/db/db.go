@@ -1,11 +1,12 @@
-// internal/db/db.go
 package db
 
 import (
 	"log"
+	"time"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 
 	"ogaos-backend/internal/config"
 )
@@ -17,14 +18,32 @@ func InitDB() {
 
 	dsn := cfg.PostgresDSN()
 	if dsn == "" {
-		log.Fatal("No database DSN found")
+		log.Fatal("database DSN is empty")
 	}
 
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	gormConfig := &gorm.Config{
+		Logger: gormlogger.Default.LogMode(gormlogger.Warn),
+	}
+
+	database, err := gorm.Open(postgres.Open(dsn), gormConfig)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("failed to connect database: %v", err)
 	}
 
-	DB = db
-	log.Println("Database connected successfully")
+	sqlDB, err := database.DB()
+	if err != nil {
+		log.Fatalf("failed to get sql.DB from gorm: %v", err)
+	}
+
+	// Connection pool tuning
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetMaxOpenConns(100)
+	sqlDB.SetConnMaxLifetime(1 * time.Hour)
+	sqlDB.SetConnMaxIdleTime(30 * time.Minute)
+
+	if err := sqlDB.Ping(); err != nil {
+		log.Fatalf("failed to ping database: %v", err)
+	}
+
+	DB = database
 }

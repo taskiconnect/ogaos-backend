@@ -1,4 +1,3 @@
-// internal/domain/models/sale.go
 package models
 
 import (
@@ -25,41 +24,38 @@ const (
 
 type Sale struct {
 	ID         uuid.UUID  `gorm:"type:uuid;primaryKey;default:uuid_generate_v4()" json:"id"`
-	BusinessID uuid.UUID  `gorm:"type:uuid;not null;index"                       json:"business_id"`
-	StoreID    *uuid.UUID `gorm:"type:uuid;index"                                json:"store_id"`
-	CustomerID *uuid.UUID `gorm:"type:uuid;index"                                json:"customer_id"`
-	InvoiceID  *uuid.UUID `gorm:"type:uuid;index"                                json:"invoice_id"`
-	RecordedBy uuid.UUID  `gorm:"type:uuid;not null"                             json:"recorded_by"`
-	StaffName  *string    `gorm:"size:255"                                       json:"staff_name,omitempty"`
+	BusinessID uuid.UUID  `gorm:"type:uuid;not null;index" json:"business_id"`
+	StoreID    *uuid.UUID `gorm:"type:uuid;index" json:"store_id"`
+	CustomerID *uuid.UUID `gorm:"type:uuid;index" json:"customer_id"`
+	InvoiceID  *uuid.UUID `gorm:"type:uuid;index" json:"invoice_id"`
+	RecordedBy uuid.UUID  `gorm:"type:uuid;not null" json:"recorded_by"`
+	StaffName  *string    `gorm:"size:255" json:"staff_name,omitempty"`
 
-	SaleNumber    string  `gorm:"size:50;uniqueIndex;not null" json:"sale_number"`
-	ReceiptNumber *string `gorm:"size:50;uniqueIndex"          json:"receipt_number"`
+	SaleNumber     string     `gorm:"size:50;uniqueIndex;not null" json:"sale_number"`
+	ReceiptNumber  *string    `gorm:"size:50;uniqueIndex" json:"receipt_number"`
+	IdempotencyKey *uuid.UUID `gorm:"type:uuid;uniqueIndex" json:"-"`
+	SubTotal       int64      `gorm:"not null" json:"sub_total"`
+	DiscountAmount int64      `gorm:"default:0" json:"discount_amount"`
+	VATRate        float64    `gorm:"default:0" json:"vat_rate"`
+	VATInclusive   bool       `gorm:"default:false" json:"vat_inclusive"`
+	VATAmount      int64      `gorm:"default:0" json:"vat_amount"`
+	WHTRate        float64    `gorm:"default:0" json:"wht_rate"`
+	WHTAmount      int64      `gorm:"default:0" json:"wht_amount"`
+	TotalAmount    int64      `gorm:"not null" json:"total_amount"`
+	AmountPaid     int64      `gorm:"default:0" json:"amount_paid"`
+	BalanceDue     int64      `gorm:"default:0" json:"balance_due"`
+	PaymentMethod  string     `gorm:"size:30;not null" json:"payment_method"`
+	Status         string     `gorm:"size:20;not null;default:'completed'" json:"status"`
+	Notes          *string    `gorm:"type:text" json:"notes,omitempty"`
+	ReceiptSentAt  *time.Time `json:"receipt_sent_at"`
+	CreatedAt      time.Time  `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt      time.Time  `gorm:"autoUpdateTime" json:"updated_at"`
 
-	SubTotal       int64   `gorm:"not null"         json:"sub_total"`
-	DiscountAmount int64   `gorm:"default:0"        json:"discount_amount"`
-	VATRate        float64 `gorm:"default:0"        json:"vat_rate"`
-	VATInclusive   bool    `gorm:"default:false"    json:"vat_inclusive"`
-	VATAmount      int64   `gorm:"default:0"        json:"vat_amount"`
-	WHTRate        float64 `gorm:"default:0"        json:"wht_rate"`
-	WHTAmount      int64   `gorm:"default:0"        json:"wht_amount"`
-	TotalAmount    int64   `gorm:"not null"         json:"total_amount"`
-	AmountPaid     int64   `gorm:"default:0"        json:"amount_paid"`
-	BalanceDue     int64   `gorm:"default:0"        json:"balance_due"`
-
-	PaymentMethod string  `gorm:"size:30;not null"                      json:"payment_method"`
-	Status        string  `gorm:"size:20;not null;default:'completed'"  json:"status"`
-	Notes         *string `gorm:"type:text"                             json:"notes,omitempty"`
-
-	ReceiptSentAt *time.Time `json:"receipt_sent_at"`
-	CreatedAt     time.Time  `gorm:"autoCreateTime" json:"created_at"`
-	UpdatedAt     time.Time  `gorm:"autoUpdateTime" json:"updated_at"`
-
-	// Relations
 	Business  Business   `gorm:"foreignKey:BusinessID" json:"-"`
-	Store     *Store     `gorm:"foreignKey:StoreID"    json:"store,omitempty"`
+	Store     *Store     `gorm:"foreignKey:StoreID" json:"store,omitempty"`
 	Customer  *Customer  `gorm:"foreignKey:CustomerID" json:"customer,omitempty"`
-	Invoice   *Invoice   `gorm:"foreignKey:InvoiceID"  json:"invoice,omitempty"`
-	SaleItems []SaleItem `gorm:"foreignKey:SaleID"     json:"items,omitempty"`
+	Invoice   *Invoice   `gorm:"foreignKey:InvoiceID" json:"invoice,omitempty"`
+	SaleItems []SaleItem `gorm:"foreignKey:SaleID" json:"items,omitempty"`
 }
 
 func (s *Sale) CalculateVAT() {
@@ -100,4 +96,3 @@ func (s *Sale) CalculateTotal() {
 		s.BalanceDue = 0
 	}
 }
-

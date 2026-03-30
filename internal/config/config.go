@@ -16,23 +16,28 @@ type Config struct {
 	Env     string
 	AppName string
 
-	// Database (Leapcell PostgreSQL)
-	DBURL string // ← REQUIRED: full connection URI from Leapcell dashboard
+	// Database
+	DBURL string
 
 	// JWT
 	JWTSecret        string
+	AdminJWTSecret   string
 	JWTExpiry        time.Duration
+	AdminJWTExpiry   time.Duration
 	JWTRefreshExpiry time.Duration
+	AdminRefreshTTL  time.Duration
 
-	// Security
-	RateLimitPerMinute int
-	AllowedOrigins     []string
+	// Security / API
+	AllowedOrigins []string
+	TrustedProxies []string
 
-	// App / Frontend
+	// Frontend
 	FrontendURL string
 
-	// Email (Resend) — read directly by internal/pkg/email/email.go via os.Getenv
-	// Declared here so they are validated at startup and visible to the team.
+	// Redis / Upstash
+	UpstashRedisURL string
+
+	// Email
 	ResendAPIKey string
 	EmailFrom    string
 
@@ -52,7 +57,7 @@ type Config struct {
 	ImageKitURLEndpoint string
 
 	// Platform
-	PlatformFeePercent int // percentage taken from digital store sales e.g. 5
+	PlatformFeePercent int
 }
 
 var (
@@ -62,7 +67,6 @@ var (
 
 func Load() *Config {
 	once.Do(func() {
-		// Load .env file if present (silent if missing)
 		_ = godotenv.Load()
 
 		cfg := &Config{
@@ -70,111 +74,108 @@ func Load() *Config {
 			Env:     getEnv("ENV", "development"),
 			AppName: getEnv("APP_NAME", "OgaOs"),
 
-			// Database
 			DBURL: getEnv("DATABASE_URL", ""),
 
-			// JWT
 			JWTSecret:        getEnv("JWT_SECRET", ""),
+			AdminJWTSecret:   getEnv("ADMIN_JWT_SECRET", ""),
 			JWTExpiry:        getEnvDuration("JWT_EXPIRY", 15*time.Minute),
-			JWTRefreshExpiry: getEnvDuration("JWT_REFRESH_EXPIRY", 168*time.Hour), // 7 days
+			AdminJWTExpiry:   getEnvDuration("ADMIN_JWT_EXPIRY", 15*time.Minute),
+			JWTRefreshExpiry: getEnvDuration("JWT_REFRESH_EXPIRY", 7*24*time.Hour),
+			AdminRefreshTTL:  getEnvDuration("ADMIN_REFRESH_TTL", 24*time.Hour),
 
-			// Security
-			RateLimitPerMinute: getEnvInt("RATE_LIMIT_PER_MINUTE", 100),
-			AllowedOrigins:     splitTrim(getEnv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")),
+			AllowedOrigins: splitTrim(
+				getEnv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"),
+			),
+			TrustedProxies: splitTrim(getEnv("TRUSTED_PROXIES", "")),
 
-			// App
 			FrontendURL: getEnv("FRONTEND_URL", "http://localhost:3000"),
 
-			// Email
-			ResendAPIKey: getEnv("RESEND_API_KEY", ""),
-			EmailFrom:    getEnv("EMAIL_FROM", "hello@ogaos.com"),
+			UpstashRedisURL: getEnv("UPSTASH_REDIS_URL", ""),
 
-			// Paystack
+			ResendAPIKey: getEnv("RESEND_API_KEY", ""),
+			EmailFrom:    getEnv("EMAIL_FROM", "hello@ogaos.taskiconnet.com"),
+
 			PaystackSecretKey:     getEnv("PAYSTACK_SECRET_KEY", ""),
 			PaystackPublicKey:     getEnv("PAYSTACK_PUBLIC_KEY", ""),
 			PaystackWebhookSecret: getEnv("PAYSTACK_WEBHOOK_SECRET", ""),
 
-			// Flutterwave
 			FlutterwaveSecretKey:   getEnv("FLUTTERWAVE_SECRET_KEY", ""),
 			FlutterwavePublicKey:   getEnv("FLUTTERWAVE_PUBLIC_KEY", ""),
 			FlutterwaveWebhookHash: getEnv("FLUTTERWAVE_WEBHOOK_HASH", ""),
 
-			// ImageKit
 			ImageKitPublicKey:   getEnv("IMAGEKIT_PUBLIC_KEY", ""),
 			ImageKitPrivateKey:  getEnv("IMAGEKIT_PRIVATE_KEY", ""),
 			ImageKitURLEndpoint: getEnv("IMAGEKIT_URL_ENDPOINT", ""),
 
-			// Platform
 			PlatformFeePercent: getEnvInt("PLATFORM_FEE_PERCENT", 5),
 		}
 
-		// ── Required fields validation ───────────────────────────────────────
-		if cfg.DBURL == "" {
-			log.Fatal("DATABASE_URL is required.\n" +
-				"→ Go to your Leapcell dashboard\n" +
-				"→ Copy the full PostgreSQL connection string (starts with postgresql://)\n" +
-				"→ Paste it into .env as: DATABASE_URL=postgresql://...")
-		}
-
-		if cfg.JWTSecret == "" {
-			log.Fatal("JWT_SECRET is required.\n" +
-				"Generate a strong random value (≥32 characters)\n" +
-				"Example: openssl rand -base64 48")
-		}
-
-		if len(cfg.JWTSecret) < 32 {
-			log.Println("WARNING: JWT_SECRET is weak (< 32 characters) — consider a longer random value!")
-		}
-
-		// ── Soft warnings for external services ──────────────────────────────
-		// These are not fatal so the app can still start in development without
-		// all payment and email keys configured.
-		if cfg.ResendAPIKey == "" {
-			log.Println("WARNING: RESEND_API_KEY is not set — emails will not be sent")
-		}
-		if cfg.PaystackSecretKey == "" {
-			log.Println("WARNING: PAYSTACK_SECRET_KEY is not set — Paystack payments will not work")
-		}
-		if cfg.FlutterwaveSecretKey == "" {
-			log.Println("WARNING: FLUTTERWAVE_SECRET_KEY is not set — Flutterwave payments will not work")
-		}
-		if cfg.ImageKitPrivateKey == "" {
-			log.Println("WARNING: IMAGEKIT_PRIVATE_KEY is not set — file uploads will not work")
-		}
-		if cfg.PaystackWebhookSecret == "" {
-			log.Println("WARNING: PAYSTACK_WEBHOOK_SECRET is not set — webhook verification will fail")
-		}
-
+		validate(cfg)
 		instance = cfg
 	})
 
 	return instance
 }
 
-// PostgresDSN returns the connection string for GORM / pgx.
+func Get() *Config {
+	return Load()
+}
+
+// Backward-compatible helper for existing DB code.
 func (c *Config) PostgresDSN() string {
 	return c.DBURL
 }
 
-// IsProduction returns true when running in production mode.
 func (c *Config) IsProduction() bool {
 	return c.Env == "production"
 }
 
-// ── Helper functions ─────────────────────────────────────────────────────────
+func validate(cfg *Config) {
+	if cfg.DBURL == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+	if cfg.JWTSecret == "" {
+		log.Fatal("JWT_SECRET is required")
+	}
+	if len(cfg.JWTSecret) < 32 {
+		log.Fatal("JWT_SECRET must be at least 32 characters")
+	}
+	if cfg.AdminJWTSecret == "" {
+		log.Fatal("ADMIN_JWT_SECRET is required")
+	}
+	if len(cfg.AdminJWTSecret) < 32 {
+		log.Fatal("ADMIN_JWT_SECRET must be at least 32 characters")
+	}
+	if cfg.AdminJWTSecret == cfg.JWTSecret {
+		log.Fatal("ADMIN_JWT_SECRET must differ from JWT_SECRET")
+	}
+	if cfg.UpstashRedisURL == "" {
+		log.Fatal("UPSTASH_REDIS_URL is required")
+	}
+
+	if cfg.ResendAPIKey == "" {
+		log.Println("WARNING: RESEND_API_KEY not set — emails may fail")
+	}
+	if cfg.PaystackSecretKey == "" {
+		log.Println("WARNING: PAYSTACK_SECRET_KEY not set — Paystack may fail")
+	}
+	if cfg.ImageKitPrivateKey == "" {
+		log.Println("WARNING: IMAGEKIT_PRIVATE_KEY not set — uploads may fail")
+	}
+}
 
 func splitTrim(s string) []string {
 	if s == "" {
 		return nil
 	}
-	var result []string
-	for _, part := range strings.Split(s, ",") {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
-			result = append(result, trimmed)
+
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
 		}
 	}
-	return result
+	return out
 }
 
 func getEnv(key, fallback string) string {
@@ -189,19 +190,20 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	if v == "" {
 		return fallback
 	}
-	// Support "7d", "30d" notation
+
 	if strings.HasSuffix(v, "d") {
 		var days float64
-		_, err := fmt.Sscanf(strings.TrimSuffix(v, "d"), "%f", &days)
-		if err == nil {
+		if _, err := fmt.Sscanf(strings.TrimSuffix(v, "d"), "%f", &days); err == nil {
 			return time.Duration(days * 24 * float64(time.Hour))
 		}
 	}
+
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		log.Printf("Invalid duration for %s: %q → using fallback", key, v)
+		log.Printf("invalid duration for %s: %q — using fallback %s", key, v, fallback)
 		return fallback
 	}
+
 	return d
 }
 
@@ -210,14 +212,12 @@ func getEnvInt(key string, fallback int) int {
 	if v == "" {
 		return fallback
 	}
+
 	var n int
 	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
-		log.Printf("Invalid integer for %s: %q → fallback used", key, v)
+		log.Printf("invalid int for %s: %q — using fallback %d", key, v, fallback)
 		return fallback
 	}
-	return n
-}
 
-func Get() *Config {
-	return Load()
+	return n
 }

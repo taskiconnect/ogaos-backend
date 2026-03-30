@@ -12,6 +12,7 @@ const (
 	PlanFree   = "free"
 	PlanGrowth = "growth"
 	PlanPro    = "pro"
+	PlanCustom = "custom"
 )
 
 // Plan prices in kobo (placeholders — update when decided)
@@ -40,6 +41,12 @@ var PlanLimits = map[string]PlanLimit{
 		MaxProducts:  -1,
 		MaxCustomers: -1,
 	},
+	PlanCustom: {
+		MaxStaff:     -1,
+		MaxStores:    -1,
+		MaxProducts:  -1,
+		MaxCustomers: -1,
+	},
 }
 
 // PlanFeatures defines which features each plan unlocks
@@ -64,6 +71,21 @@ var PlanFeatures = map[string][]string{
 		"stores",
 	},
 	PlanPro: {
+		"sales",
+		"ledger",
+		"customers_basic",
+		"digital_store",
+		"debt_tracking",
+		"expense_tracking",
+		"recruitment",
+		"identity_kyc",
+		"public_profile",
+		"staff_management",
+		"stores",
+		"custom_domain",
+		"priority_support",
+	},
+	PlanCustom: {
 		"sales",
 		"ledger",
 		"customers_basic",

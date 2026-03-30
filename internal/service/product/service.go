@@ -1,8 +1,9 @@
-// internal/service/product/service.go
 package product
 
 import (
 	"errors"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -62,14 +63,35 @@ type ListFilter struct {
 
 // ─── Methods ─────────────────────────────────────────────────────────────────
 
-func (s *Service) Create(businessID uuid.UUID, req CreateRequest) (*models.Product, error) {
+func (s *Service) Create(businessID uuid.UUID, req CreateRequest, idempotencyKey string) (*models.Product, error) {
 	if req.Type != models.ProductTypeProduct && req.Type != models.ProductTypeService {
 		return nil, errors.New("type must be 'product' or 'service'")
 	}
+
+	var parsedKey *uuid.UUID
+	if strings.TrimSpace(idempotencyKey) != "" {
+		if key, err := uuid.Parse(strings.TrimSpace(idempotencyKey)); err == nil {
+			parsedKey = &key
+
+			var existing models.Product
+			err := s.db.
+				Where("business_id = ? AND idempotency_key = ? AND created_at > ?", businessID, key, time.Now().UTC().Add(-24*time.Hour)).
+				First(&existing).Error
+
+			if err == nil {
+				return &existing, nil
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, err
+			}
+		}
+	}
+
 	threshold := req.LowStockThreshold
 	if threshold == 0 {
 		threshold = 5
 	}
+
 	p := models.Product{
 		BusinessID:        businessID,
 		StoreID:           req.StoreID,
@@ -82,7 +104,9 @@ func (s *Service) Create(businessID uuid.UUID, req CreateRequest) (*models.Produ
 		TrackInventory:    req.TrackInventory,
 		StockQuantity:     req.StockQuantity,
 		LowStockThreshold: threshold,
+		IdempotencyKey:    parsedKey,
 	}
+
 	if err := s.db.Create(&p).Error; err != nil {
 		return nil, err
 	}
@@ -181,7 +205,6 @@ func (s *Service) Update(businessID, productID uuid.UUID, req UpdateRequest) (*m
 }
 
 // AdjustStock adds or subtracts from stock_quantity.
-// Positive qty = stock in, negative = manual reduction.
 func (s *Service) AdjustStock(businessID, productID uuid.UUID, req AdjustStockRequest) (*models.Product, error) {
 	var p models.Product
 	if err := s.db.Where("id = ? AND business_id = ?", productID, businessID).First(&p).Error; err != nil {

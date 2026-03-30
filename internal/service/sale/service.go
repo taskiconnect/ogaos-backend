@@ -1,15 +1,17 @@
-// internal/service/sale/service.go
 package sale
 
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 
 	"ogaos-backend/internal/domain/models"
+	apperr "ogaos-backend/internal/pkg/errors"
 )
 
 type Service struct {
@@ -38,7 +40,7 @@ type CreateRequest struct {
 	StaffName      *string             `json:"staff_name"`
 	Items          []CreateItemRequest `json:"items" binding:"required,min=1"`
 	PaymentMethod  string              `json:"payment_method" binding:"required"`
-	AmountPaid     int64               `json:"amount_paid"` // 0 is valid — means full credit / pay-later
+	AmountPaid     int64               `json:"amount_paid"`
 	DiscountAmount int64               `json:"discount_amount"`
 	VATRate        float64             `json:"vat_rate"`
 	VATInclusive   bool                `json:"vat_inclusive"`
@@ -56,21 +58,111 @@ type ListFilter struct {
 	Limit      int
 }
 
-// RecordPaymentRequest is used for POST /sales/:id/payment
 type RecordPaymentRequest struct {
-	Amount        int64  `json:"amount" binding:"required,min=1"` // kobo
+	Amount        int64  `json:"amount" binding:"required,min=1"`
 	PaymentMethod string `json:"payment_method"`
 	Note          string `json:"note"`
 }
 
-// CancelRequest is used for PATCH /sales/:id/cancel
 type CancelRequest struct {
-	Reason string `json:"reason"` // optional — displayed to the business owner
+	Reason string `json:"reason"`
+}
+
+// ─── DB error mapping ────────────────────────────────────────────────────────
+
+func fromDB(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return apperr.Wrap(apperr.CodeNotFound, "sale not found", err)
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "23505":
+			switch pgErr.ConstraintName {
+			case "sales_sale_number_key":
+				return apperr.Wrap(
+					apperr.CodeConflict,
+					"This sale appears to have already been recorded. Please refresh and check your sales list.",
+					err,
+				)
+			default:
+				return apperr.Wrap(apperr.CodeConflict, "resource already exists", err)
+			}
+		case "23503":
+			return apperr.Wrap(apperr.CodeBadRequest, "one or more selected records are invalid", err)
+		case "23514":
+			return apperr.Wrap(apperr.CodeBadRequest, "one or more submitted values are invalid", err)
+		case "22P02":
+			return apperr.Wrap(apperr.CodeBadRequest, "invalid input format", err)
+		default:
+			return apperr.Wrap(apperr.CodeInternal, apperr.ErrInternal.Message, err)
+		}
+	}
+
+	return apperr.Wrap(apperr.CodeInternal, apperr.ErrInternal.Message, err)
+}
+
+func normalizePaymentMethod(method string) string {
+	return strings.ToLower(strings.TrimSpace(method))
 }
 
 // ─── Create ──────────────────────────────────────────────────────────────────
 
-func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*models.Sale, error) {
+func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, idempotencyKey string) (*models.Sale, error) {
+	if businessID == uuid.Nil {
+		return nil, apperr.New(apperr.CodeBadRequest, "business is required")
+	}
+	if recordedBy == uuid.Nil {
+		return nil, apperr.New(apperr.CodeBadRequest, "recorded by is required")
+	}
+	if len(req.Items) == 0 {
+		return nil, apperr.New(apperr.CodeBadRequest, "at least one sale item is required")
+	}
+
+	req.PaymentMethod = normalizePaymentMethod(req.PaymentMethod)
+	if req.PaymentMethod == "" {
+		return nil, apperr.New(apperr.CodeBadRequest, "payment method is required")
+	}
+
+	if req.DiscountAmount < 0 {
+		return nil, apperr.New(apperr.CodeBadRequest, "discount amount cannot be negative")
+	}
+	if req.AmountPaid < 0 {
+		return nil, apperr.New(apperr.CodeBadRequest, "amount paid cannot be negative")
+	}
+	if req.VATRate < 0 || req.WHTRate < 0 {
+		return nil, apperr.New(apperr.CodeBadRequest, "tax rates cannot be negative")
+	}
+
+	var parsedKey *uuid.UUID
+	trimmedKey := strings.TrimSpace(idempotencyKey)
+	if trimmedKey != "" {
+		key, err := uuid.Parse(trimmedKey)
+		if err != nil {
+			return nil, apperr.Wrap(apperr.CodeBadRequest, "invalid idempotency key", err)
+		}
+		parsedKey = &key
+
+		var existing models.Sale
+		err = s.db.
+			Where("business_id = ? AND idempotency_key = ? AND created_at > ?", businessID, key, time.Now().UTC().Add(-24*time.Hour)).
+			Preload("SaleItems").
+			Preload("Customer").
+			First(&existing).Error
+
+		if err == nil {
+			return &existing, nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fromDB(err)
+		}
+	}
+
 	saleNumber, err := s.nextSaleNumber(businessID)
 	if err != nil {
 		return nil, err
@@ -78,14 +170,29 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 
 	var items []models.SaleItem
 	var subTotal int64
+
 	for _, item := range req.Items {
+		if strings.TrimSpace(item.ProductName) == "" {
+			return nil, apperr.New(apperr.CodeBadRequest, "each sale item must have a product name")
+		}
+		if item.UnitPrice < 1 {
+			return nil, apperr.New(apperr.CodeBadRequest, "unit price must be greater than zero")
+		}
+		if item.Quantity < 1 {
+			return nil, apperr.New(apperr.CodeBadRequest, "quantity must be at least 1")
+		}
+		if item.Discount < 0 {
+			return nil, apperr.New(apperr.CodeBadRequest, "item discount cannot be negative")
+		}
+
 		lineTotal := (item.UnitPrice * int64(item.Quantity)) - item.Discount
 		if lineTotal < 0 {
 			lineTotal = 0
 		}
+
 		items = append(items, models.SaleItem{
 			ProductID:   item.ProductID,
-			ProductName: item.ProductName,
+			ProductName: strings.TrimSpace(item.ProductName),
 			ProductSKU:  item.ProductSKU,
 			UnitPrice:   item.UnitPrice,
 			Quantity:    item.Quantity,
@@ -110,27 +217,21 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 		WHTRate:        req.WHTRate,
 		PaymentMethod:  req.PaymentMethod,
 		Notes:          req.Notes,
+		IdempotencyKey: parsedKey,
 	}
 
 	sale.CalculateTotal()
 
-	// Cap amount paid at total — prevents over-payment on creation.
-	// Zero is valid: it means the customer hasn't paid anything yet (full credit).
 	sale.AmountPaid = req.AmountPaid
-	if sale.AmountPaid < 0 {
-		sale.AmountPaid = 0
-	}
 	if sale.AmountPaid > sale.TotalAmount {
 		sale.AmountPaid = sale.TotalAmount
 	}
+
 	sale.BalanceDue = sale.TotalAmount - sale.AmountPaid
 	if sale.BalanceDue < 0 {
 		sale.BalanceDue = 0
 	}
 
-	// Status logic:
-	//   completed  → fully paid (balance = 0)
-	//   partial    → some or no payment made (balance > 0)
 	if sale.BalanceDue <= 0 {
 		sale.Status = models.SaleStatusCompleted
 	} else {
@@ -139,33 +240,35 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 
 	err = s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&sale).Error; err != nil {
-			return err
+			return fromDB(err)
 		}
 
 		for i := range items {
 			items[i].SaleID = sale.ID
 		}
+
 		if err := tx.Create(&items).Error; err != nil {
-			return err
+			return fromDB(err)
 		}
 
-		// Decrement inventory for tracked products
 		for _, item := range req.Items {
 			if item.ProductID != nil {
-				tx.Model(&models.Product{}).
+				if err := tx.Model(&models.Product{}).
 					Where("id = ? AND business_id = ? AND track_inventory = true", *item.ProductID, businessID).
-					UpdateColumn("stock_quantity", gorm.Expr("stock_quantity - ?", item.Quantity))
+					UpdateColumn("stock_quantity", gorm.Expr("stock_quantity - ?", item.Quantity)).Error; err != nil {
+					return fromDB(err)
+				}
 			}
 		}
 
-		// Update customer purchase stats
 		if req.CustomerID != nil {
-			tx.Model(&models.Customer{}).Where("id = ?", *req.CustomerID).Updates(map[string]interface{}{
+			if err := tx.Model(&models.Customer{}).Where("id = ?", *req.CustomerID).Updates(map[string]interface{}{
 				"total_purchases": gorm.Expr("total_purchases + ?", sale.TotalAmount),
 				"total_orders":    gorm.Expr("total_orders + 1"),
-			})
+			}).Error; err != nil {
+				return fromDB(err)
+			}
 
-			// Auto-create a debt record for any unpaid balance (including full zero-payment)
 			if sale.BalanceDue > 0 {
 				debt := models.Debt{
 					BusinessID:  businessID,
@@ -178,14 +281,16 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 					RecordedBy:  recordedBy,
 				}
 				if err := tx.Create(&debt).Error; err != nil {
-					return err
+					return fromDB(err)
 				}
-				tx.Model(&models.Customer{}).Where("id = ?", *req.CustomerID).
-					UpdateColumn("outstanding_debt", gorm.Expr("outstanding_debt + ?", sale.BalanceDue))
+
+				if err := tx.Model(&models.Customer{}).Where("id = ?", *req.CustomerID).
+					UpdateColumn("outstanding_debt", gorm.Expr("outstanding_debt + ?", sale.BalanceDue)).Error; err != nil {
+					return fromDB(err)
+				}
 			}
 		}
 
-		// Ledger entry only if something was actually paid now
 		if sale.AmountPaid > 0 {
 			ledger := models.LedgerEntry{
 				BusinessID:  businessID,
@@ -197,8 +302,11 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 				Description: "Sale " + saleNumber,
 				RecordedBy:  recordedBy,
 			}
-			return tx.Create(&ledger).Error
+			if err := tx.Create(&ledger).Error; err != nil {
+				return fromDB(err)
+			}
 		}
+
 		return nil
 	})
 	if err != nil {
@@ -211,89 +319,79 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 
 // ─── Cancel ──────────────────────────────────────────────────────────────────
 
-// Cancel marks a sale as cancelled and fully reverses all its side-effects:
-//   - Restores stock for every tracked product line item
-//   - Reverses the customer's total_purchases, total_orders, and outstanding_debt
-//   - Cancels the linked debt record (if any) so it no longer appears as owed
-//   - Posts a debit ledger entry to reverse any revenue already recorded
-//
-// A cancelled sale is never hard-deleted — it stays visible to the business
-// owner so they can see who cancelled it and when. It is excluded from all
-// revenue and total-sales aggregations via the status = 'cancelled' filter.
 func (s *Service) Cancel(businessID, saleID, cancelledBy uuid.UUID, req CancelRequest) (*models.Sale, error) {
 	var sale models.Sale
 	if err := s.db.Where("id = ? AND business_id = ?", saleID, businessID).
 		Preload("SaleItems").
 		Preload("Customer").
 		First(&sale).Error; err != nil {
-		return nil, errors.New("sale not found")
+		return nil, apperr.New(apperr.CodeNotFound, "sale not found")
 	}
 
 	if sale.Status == models.SaleStatusCancelled {
-		return nil, errors.New("sale is already cancelled")
+		return nil, apperr.New(apperr.CodeConflict, "sale is already cancelled")
 	}
 
-	// Build a cancellation note that preserves who did it and why
-	reason := req.Reason
+	reason := strings.TrimSpace(req.Reason)
 	if reason == "" {
 		reason = "no reason given"
 	}
 	cancelNote := fmt.Sprintf("Cancelled by staff (user %s): %s", cancelledBy.String(), reason)
 
 	err := s.db.Transaction(func(tx *gorm.DB) error {
-		// 1. Mark sale cancelled and record who/why
 		if err := tx.Model(&sale).Updates(map[string]interface{}{
 			"status": models.SaleStatusCancelled,
 			"notes":  cancelNote,
 		}).Error; err != nil {
-			return err
+			return fromDB(err)
 		}
 		sale.Status = models.SaleStatusCancelled
 
-		// 2. Restore inventory for every tracked product in the sale
 		for _, item := range sale.SaleItems {
 			if item.ProductID != nil {
-				tx.Model(&models.Product{}).
+				if err := tx.Model(&models.Product{}).
 					Where("id = ? AND business_id = ? AND track_inventory = true", *item.ProductID, businessID).
-					UpdateColumn("stock_quantity", gorm.Expr("stock_quantity + ?", item.Quantity))
+					UpdateColumn("stock_quantity", gorm.Expr("stock_quantity + ?", item.Quantity)).Error; err != nil {
+					return fromDB(err)
+				}
 			}
 		}
 
-		// 3. Reverse customer stats and linked debt
 		if sale.CustomerID != nil {
-			// Roll back purchase totals
-			tx.Model(&models.Customer{}).Where("id = ?", *sale.CustomerID).Updates(map[string]interface{}{
+			if err := tx.Model(&models.Customer{}).Where("id = ?", *sale.CustomerID).Updates(map[string]interface{}{
 				"total_purchases": gorm.Expr("GREATEST(total_purchases - ?, 0)", sale.TotalAmount),
 				"total_orders":    gorm.Expr("GREATEST(total_orders - 1, 0)"),
-			})
+			}).Error; err != nil {
+				return fromDB(err)
+			}
 
-			// Cancel the linked debt record so it stops showing as outstanding
 			debtDesc := fmt.Sprintf("Balance from sale %s", sale.SaleNumber)
 			var debt models.Debt
 			if err := tx.Where("business_id = ? AND description = ? AND status != ?",
 				businessID, debtDesc, models.DebtStatusSettled).
 				First(&debt).Error; err == nil {
 				remainingDue := debt.AmountDue
+
 				if err := tx.Model(&debt).Updates(map[string]interface{}{
 					"status":     "cancelled",
 					"amount_due": 0,
 				}).Error; err != nil {
-					return err
+					return fromDB(err)
 				}
-				// Reduce outstanding_debt by whatever was still owed
+
 				if remainingDue > 0 {
-					tx.Model(&models.Customer{}).Where("id = ?", *sale.CustomerID).
-						UpdateColumn("outstanding_debt", gorm.Expr("GREATEST(outstanding_debt - ?, 0)", remainingDue))
+					if err := tx.Model(&models.Customer{}).Where("id = ?", *sale.CustomerID).
+						UpdateColumn("outstanding_debt", gorm.Expr("GREATEST(outstanding_debt - ?, 0)", remainingDue)).Error; err != nil {
+						return fromDB(err)
+					}
 				}
 			}
 		}
 
-		// 4. If any money was already collected, post a reversing debit ledger entry
-		//    so the revenue figure is corrected automatically.
 		if sale.AmountPaid > 0 {
 			reversal := models.LedgerEntry{
 				BusinessID:  businessID,
-				Type:        models.LedgerDebit, // debit = reversal of income
+				Type:        models.LedgerDebit,
 				SourceType:  models.LedgerSourceSale,
 				SourceID:    sale.ID,
 				Amount:      sale.AmountPaid,
@@ -301,8 +399,11 @@ func (s *Service) Cancel(businessID, saleID, cancelledBy uuid.UUID, req CancelRe
 				Description: fmt.Sprintf("Reversal — sale %s cancelled", sale.SaleNumber),
 				RecordedBy:  cancelledBy,
 			}
-			return tx.Create(&reversal).Error
+			if err := tx.Create(&reversal).Error; err != nil {
+				return fromDB(err)
+			}
 		}
+
 		return nil
 	})
 	if err != nil {
@@ -315,26 +416,31 @@ func (s *Service) Cancel(businessID, saleID, cancelledBy uuid.UUID, req CancelRe
 // ─── RecordPayment ────────────────────────────────────────────────────────────
 
 func (s *Service) RecordPayment(businessID, saleID, recordedBy uuid.UUID, req RecordPaymentRequest) (*models.Sale, error) {
+	if req.Amount < 1 {
+		return nil, apperr.New(apperr.CodeBadRequest, "payment amount must be greater than zero")
+	}
+
 	var sale models.Sale
 	if err := s.db.Where("id = ? AND business_id = ?", saleID, businessID).
-		Preload("Customer").First(&sale).Error; err != nil {
-		return nil, errors.New("sale not found")
+		Preload("Customer").
+		First(&sale).Error; err != nil {
+		return nil, apperr.New(apperr.CodeNotFound, "sale not found")
 	}
 
 	if sale.Status == models.SaleStatusCancelled {
-		return nil, errors.New("cannot record payment on a cancelled sale")
+		return nil, apperr.New(apperr.CodeConflict, "cannot record payment on a cancelled sale")
 	}
 	if sale.BalanceDue <= 0 {
-		return nil, errors.New("sale is already fully paid")
+		return nil, apperr.New(apperr.CodeConflict, "sale is already fully paid")
 	}
 	if req.Amount > sale.BalanceDue {
-		return nil, fmt.Errorf("payment of ₦%.2f exceeds balance due of ₦%.2f",
-			float64(req.Amount)/100, float64(sale.BalanceDue)/100)
+		return nil, apperr.New(apperr.CodeBadRequest, "payment amount exceeds balance due")
 	}
 
 	prevBalance := sale.BalanceDue
 	sale.AmountPaid += req.Amount
 	sale.BalanceDue -= req.Amount
+
 	if sale.BalanceDue <= 0 {
 		sale.BalanceDue = 0
 		sale.Status = models.SaleStatusCompleted
@@ -342,41 +448,60 @@ func (s *Service) RecordPayment(businessID, saleID, recordedBy uuid.UUID, req Re
 		sale.Status = models.SaleStatusPartial
 	}
 
+	paymentMethod := normalizePaymentMethod(req.PaymentMethod)
+	if paymentMethod == "" {
+		paymentMethod = sale.PaymentMethod
+	}
+
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&sale).Updates(map[string]interface{}{
-			"amount_paid": sale.AmountPaid,
-			"balance_due": sale.BalanceDue,
-			"status":      sale.Status,
+			"amount_paid":    sale.AmountPaid,
+			"balance_due":    sale.BalanceDue,
+			"status":         sale.Status,
+			"payment_method": paymentMethod,
 		}).Error; err != nil {
-			return err
+			return fromDB(err)
 		}
 
 		var debt models.Debt
 		debtDesc := fmt.Sprintf("Balance from sale %s", sale.SaleNumber)
-		if err := tx.Where("business_id = ? AND description = ?", businessID, debtDesc).
-			First(&debt).Error; err == nil {
+		err := tx.Where("business_id = ? AND description = ?", businessID, debtDesc).
+			First(&debt).Error
+
+		if err == nil {
 			debt.AmountPaid += req.Amount
 			debt.UpdateStatus()
+
 			if err := tx.Model(&debt).Updates(map[string]interface{}{
 				"amount_paid": debt.AmountPaid,
 				"amount_due":  debt.AmountDue,
 				"status":      debt.Status,
 			}).Error; err != nil {
-				return err
+				return fromDB(err)
 			}
+
 			if debt.CustomerID != nil {
-				tx.Model(&models.Customer{}).Where("id = ?", *debt.CustomerID).
-					UpdateColumn("outstanding_debt", gorm.Expr("outstanding_debt - ?", req.Amount))
+				if err := tx.Model(&models.Customer{}).Where("id = ?", *debt.CustomerID).
+					UpdateColumn("outstanding_debt", gorm.Expr("GREATEST(outstanding_debt - ?, 0)", req.Amount)).Error; err != nil {
+					return fromDB(err)
+				}
 			}
-		} else if sale.CustomerID != nil && prevBalance > 0 {
-			tx.Model(&models.Customer{}).Where("id = ?", *sale.CustomerID).
-				UpdateColumn("outstanding_debt", gorm.Expr("outstanding_debt - ?", req.Amount))
+		} else if errors.Is(err, gorm.ErrRecordNotFound) {
+			if sale.CustomerID != nil && prevBalance > 0 {
+				if err := tx.Model(&models.Customer{}).Where("id = ?", *sale.CustomerID).
+					UpdateColumn("outstanding_debt", gorm.Expr("GREATEST(outstanding_debt - ?, 0)", req.Amount)).Error; err != nil {
+					return fromDB(err)
+				}
+			}
+		} else {
+			return fromDB(err)
 		}
 
-		note := req.Note
+		note := strings.TrimSpace(req.Note)
 		if note == "" {
 			note = fmt.Sprintf("Payment for sale %s", sale.SaleNumber)
 		}
+
 		ledger := models.LedgerEntry{
 			BusinessID:  businessID,
 			Type:        models.LedgerCredit,
@@ -387,12 +512,17 @@ func (s *Service) RecordPayment(businessID, saleID, recordedBy uuid.UUID, req Re
 			Description: note,
 			RecordedBy:  recordedBy,
 		}
-		return tx.Create(&ledger).Error
+		if err := tx.Create(&ledger).Error; err != nil {
+			return fromDB(err)
+		}
+
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	sale.PaymentMethod = paymentMethod
 	return &sale, nil
 }
 
@@ -405,8 +535,9 @@ func (s *Service) Get(businessID, saleID uuid.UUID) (*models.Sale, error) {
 		Preload("Customer").
 		First(&sale).Error
 	if err != nil {
-		return nil, errors.New("sale not found")
+		return nil, apperr.New(apperr.CodeNotFound, "sale not found")
 	}
+
 	return &sale, nil
 }
 
@@ -422,14 +553,15 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Sale, 
 	offset := (filter.Page - 1) * filter.Limit
 
 	q := s.db.Model(&models.Sale{}).Where("business_id = ?", businessID)
+
 	if filter.StoreID != nil {
 		q = q.Where("store_id = ?", *filter.StoreID)
 	}
 	if filter.CustomerID != nil {
 		q = q.Where("customer_id = ?", *filter.CustomerID)
 	}
-	if filter.Status != "" {
-		q = q.Where("status = ?", filter.Status)
+	if strings.TrimSpace(filter.Status) != "" {
+		q = q.Where("status = ?", strings.ToLower(strings.TrimSpace(filter.Status)))
 	}
 	if filter.DateFrom != nil {
 		q = q.Where("created_at >= ?", *filter.DateFrom)
@@ -439,7 +571,9 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Sale, 
 	}
 
 	var total int64
-	q.Count(&total)
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, fromDB(err)
+	}
 
 	var sales []models.Sale
 	err := q.Preload("Customer").
@@ -447,7 +581,11 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Sale, 
 		Limit(filter.Limit).
 		Order("created_at DESC").
 		Find(&sales).Error
-	return sales, total, err
+	if err != nil {
+		return nil, 0, fromDB(err)
+	}
+
+	return sales, total, nil
 }
 
 // ─── GenerateReceipt ──────────────────────────────────────────────────────────
@@ -455,8 +593,10 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Sale, 
 func (s *Service) GenerateReceipt(businessID, saleID uuid.UUID) (*models.Sale, error) {
 	var sale models.Sale
 	if err := s.db.Where("id = ? AND business_id = ?", saleID, businessID).
-		Preload("SaleItems").Preload("Customer").First(&sale).Error; err != nil {
-		return nil, errors.New("sale not found")
+		Preload("SaleItems").
+		Preload("Customer").
+		First(&sale).Error; err != nil {
+		return nil, apperr.New(apperr.CodeNotFound, "sale not found")
 	}
 
 	if sale.ReceiptNumber != nil {
@@ -467,9 +607,11 @@ func (s *Service) GenerateReceipt(businessID, saleID uuid.UUID) (*models.Sale, e
 	if err != nil {
 		return nil, err
 	}
+
 	if err := s.db.Model(&sale).Update("receipt_number", receiptNumber).Error; err != nil {
-		return nil, err
+		return nil, fromDB(err)
 	}
+
 	sale.ReceiptNumber = &receiptNumber
 	return &sale, nil
 }
@@ -486,8 +628,9 @@ func (s *Service) nextSaleNumber(businessID uuid.UUID) (string, error) {
 		RETURNING last_sale_number
 	`, businessID).Scan(&seq).Error
 	if err != nil {
-		return "", fmt.Errorf("could not generate sale number: %w", err)
+		return "", apperr.Wrap(apperr.CodeInternal, "could not generate sale number", err)
 	}
+
 	return fmt.Sprintf("SL-%06d", seq.LastSaleNumber), nil
 }
 
@@ -501,7 +644,8 @@ func (s *Service) nextReceiptNumber(businessID uuid.UUID) (string, error) {
 		RETURNING last_receipt_number
 	`, businessID).Scan(&seq).Error
 	if err != nil {
-		return "", fmt.Errorf("could not generate receipt number: %w", err)
+		return "", apperr.Wrap(apperr.CodeInternal, "could not generate receipt number", err)
 	}
+
 	return fmt.Sprintf("RC-%06d", seq.LastReceiptNumber), nil
 }

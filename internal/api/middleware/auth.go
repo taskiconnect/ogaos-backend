@@ -1,3 +1,4 @@
+// internal/api/middleware/auth.go
 package middleware
 
 import (
@@ -9,18 +10,27 @@ import (
 	"ogaos-backend/internal/pkg/jwtpkg"
 )
 
-func AuthMiddleware(secret []byte) gin.HandlerFunc {
+// AuthMiddleware validates regular user (owner/staff) access tokens.
+// It uses the USER-specific JWT secret only.
+// Platform admin tokens signed with the admin secret will fail here — by design.
+func AuthMiddleware(userSecret []byte) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"success": false, "message": "missing or invalid authorization header"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"message": "missing or invalid authorization header",
+			})
 			return
 		}
 
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		claims, err := jwtpkg.ParseAccessToken(token, secret)
+		claims, err := jwtpkg.ParseAccessToken(token, userSecret)
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"success": false, "message": "invalid token"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"message": "invalid or expired token",
+			})
 			return
 		}
 
@@ -30,18 +40,6 @@ func AuthMiddleware(secret []byte) gin.HandlerFunc {
 		c.Set("role", claims.Role)
 		c.Set("is_platform", claims.IsPlatform)
 
-		c.Next()
-	}
-}
-
-// Optional: restrict to platform admins only
-func PlatformAdminOnly() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		isPlatform := c.GetBool("is_platform")
-		if !isPlatform {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "message": "platform admin access required"})
-			return
-		}
 		c.Next()
 	}
 }

@@ -1,89 +1,125 @@
 package coupon
 
 import (
-	"net/http"
+	"log/slog"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 
 	"ogaos-backend/internal/api/response"
 	"ogaos-backend/internal/domain/models"
+	apperr "ogaos-backend/internal/pkg/errors"
 	"ogaos-backend/internal/service/coupon"
 )
 
 type Handler struct {
 	service *coupon.Service
+	log     *slog.Logger
 }
 
-func NewHandler(service *coupon.Service) *Handler {
-	return &Handler{service: service}
+func NewHandler(service *coupon.Service, log *slog.Logger) *Handler {
+	return &Handler{
+		service: service,
+		log:     log,
+	}
 }
 
-// Create – ONLY PLATFORM ADMINS (already protected in routes)
 func (h *Handler) Create(c *gin.Context) {
 	var req struct {
 		Code            string   `json:"code" binding:"required"`
 		Description     string   `json:"description"`
+		DiscountType    string   `json:"discount_type"`
 		DiscountValue   int      `json:"discount_value" binding:"required,min=1,max=100"`
 		ApplicablePlans []string `json:"applicable_plans" binding:"required"`
 		StartsAt        string   `json:"starts_at" binding:"required"`
 		ExpiresAt       string   `json:"expires_at" binding:"required"`
 		MaxRedemptions  int      `json:"max_redemptions" binding:"min=0"`
+		IsActive        *bool    `json:"is_active"`
 	}
+
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		response.BadRequest(c, "invalid request body")
 		return
 	}
 
-	startsAt, _ := time.Parse(time.RFC3339, req.StartsAt)
-	expiresAt, _ := time.Parse(time.RFC3339, req.ExpiresAt)
+	startsAt, err := time.Parse(time.RFC3339, req.StartsAt)
+	if err != nil {
+		response.BadRequest(c, "starts_at must be a valid RFC3339 datetime")
+		return
+	}
+
+	expiresAt, err := time.Parse(time.RFC3339, req.ExpiresAt)
+	if err != nil {
+		response.BadRequest(c, "expires_at must be a valid RFC3339 datetime")
+		return
+	}
+
+	adminIDValue, ok := c.Get("admin_id")
+	if !ok {
+		apperr.Respond(c, h.log, apperr.New(apperr.CodeUnauthorized, "authentication required"))
+		return
+	}
+
+	adminID, ok := adminIDValue.(uuid.UUID)
+	if !ok {
+		apperr.Respond(c, h.log, apperr.New(apperr.CodeUnauthorized, "authentication required"))
+		return
+	}
+
+	isActive := true
+	if req.IsActive != nil {
+		isActive = *req.IsActive
+	}
 
 	cpn := &models.Coupon{
 		Code:            req.Code,
 		Description:     req.Description,
+		DiscountType:    req.DiscountType,
 		DiscountValue:   req.DiscountValue,
-		ApplicablePlans: req.ApplicablePlans,
+		ApplicablePlans: pq.StringArray(req.ApplicablePlans),
 		StartsAt:        startsAt,
 		ExpiresAt:       expiresAt,
 		MaxRedemptions:  req.MaxRedemptions,
-		CreatedBy:       c.MustGet("user_id").(uuid.UUID),
+		IsActive:        isActive,
+		CreatedBy:       adminID,
 	}
 
 	if err := h.service.Create(cpn); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		apperr.Respond(c, h.log, err)
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"success": true, "message": "Coupon created successfully", "data": cpn})
+	response.Created(c, cpn)
 }
 
-// List – shows all coupons + live redemption stats
 func (h *Handler) List(c *gin.Context) {
 	data, err := h.service.List()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": err.Error()})
+		apperr.Respond(c, h.log, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+
+	response.OK(c, data)
 }
 
-// Get single coupon
 func (h *Handler) Get(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "invalid coupon id")
 		return
 	}
+
 	cpn, err := h.service.Get(id)
 	if err != nil {
-		response.NotFound(c, "coupon not found")
+		apperr.Respond(c, h.log, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": cpn})
+
+	response.OK(c, cpn)
 }
 
-// Update coupon
 func (h *Handler) Update(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -93,27 +129,29 @@ func (h *Handler) Update(c *gin.Context) {
 
 	var updates map[string]interface{}
 	if err := c.ShouldBindJSON(&updates); err != nil {
-		response.BadRequest(c, err.Error())
+		response.BadRequest(c, "invalid request body")
 		return
 	}
 
 	if err := h.service.Update(id, updates); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		apperr.Respond(c, h.log, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Coupon updated"})
+
+	response.Message(c, "coupon updated successfully")
 }
 
-// Delete (soft delete)
 func (h *Handler) Delete(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "invalid coupon id")
 		return
 	}
+
 	if err := h.service.Delete(id); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		apperr.Respond(c, h.log, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Coupon deleted"})
+
+	response.Message(c, "coupon deleted successfully")
 }

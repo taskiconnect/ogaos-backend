@@ -2,369 +2,215 @@
 package auth
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/google/uuid"
 
-	"ogaos-backend/internal/service/auth"
+	apperr "ogaos-backend/internal/pkg/errors"
+	svc "ogaos-backend/internal/service/auth"
 )
 
-// Handler is the HTTP handler layer for authentication endpoints
 type Handler struct {
-	service *auth.AuthService
+	service *svc.AuthService
+	secure  bool // true in production — controls Secure flag on cookies
+	log     *slog.Logger
 }
 
-// NewHandler creates a new auth handler instance
-func NewHandler(service *auth.AuthService) *Handler {
-	return &Handler{
-		service: service,
-	}
+func NewHandler(service *svc.AuthService, isProduction bool, log *slog.Logger) *Handler {
+	return &Handler{service: service, secure: isProduction, log: log}
 }
 
-// Register creates a new business owner account
+// Register — create a new business owner account
 func (h *Handler) Register(c *gin.Context) {
-	var req auth.RegisterRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+	var req svc.RegisterRequest
+	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid request body"})
 		return
 	}
-
 	if err := h.service.Register(req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+		apperr.Respond(c, h.log, err)
 		return
 	}
-
 	c.JSON(http.StatusCreated, gin.H{
 		"success": true,
-		"message": "Account created successfully. Please check your email to verify.",
+		"message": "account created — check your email to verify before logging in",
 	})
 }
 
-// VerifyEmail verifies the email using the token from the link
+// VerifyEmail — POST /auth/verify  (token in JSON body)
 func (h *Handler) VerifyEmail(c *gin.Context) {
-	token := c.Query("token")
-	if token == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "Verification token is required",
-		})
+	var req struct {
+		Token string `json:"token" binding:"required"`
+	}
+	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "verification token is required"})
 		return
 	}
-
-	if err := h.service.VerifyEmail(token); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+	if err := h.service.VerifyEmail(req.Token); err != nil {
+		apperr.Respond(c, h.log, err)
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Email verified successfully. You can now log in.",
-	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "email verified — you can now log in"})
 }
 
-// ResendVerification sends a new verification email to an unverified account.
-// POST /api/v1/auth/resend-verification
-// Body: { "email": "user@example.com" }
+// ResendVerification — always returns 200 (no email enumeration)
 func (h *Handler) ResendVerification(c *gin.Context) {
 	var req struct {
 		Email string `json:"email" binding:"required,email"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid request body"})
 		return
 	}
-
-	if err := h.service.ResendVerification(req.Email); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
-		return
-	}
-
-	// Always return the same message — don't leak whether the email exists
+	_ = h.service.ResendVerification(req.Email) // errors are swallowed intentionally
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"message": "If that email is registered and unverified, a new verification link has been sent.",
+		"message": "if that email is registered and unverified, a new link has been sent",
 	})
 }
 
-// Login authenticates a user (owner, staff or platform admin)
+// Login — email + password → access token (cookie: refresh token)
 func (h *Handler) Login(c *gin.Context) {
 	var req struct {
-		Email    string `json:"email" binding:"required,email"`
+		Email    string `json:"email"    binding:"required,email"`
 		Password string `json:"password" binding:"required,min=8"`
 	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid request body"})
 		return
 	}
-
 	accessToken, refreshToken, err := h.service.Login(req.Email, req.Password)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+		apperr.Respond(c, h.log, err)
 		return
 	}
-
-	c.SetCookie(
-		"refresh_token",
-		refreshToken,
-		3600*24*7,
-		"/",
-		"",
-		true,
-		true,
-	)
-
+	h.setRefreshCookie(c, refreshToken)
 	c.JSON(http.StatusOK, gin.H{
 		"success":      true,
 		"access_token": accessToken,
-		"message":      "Login successful",
+		"message":      "login successful",
 	})
 }
 
-// Refresh exchanges a valid refresh token for a new access + refresh pair
+// Refresh — rotate refresh token → new access + refresh
 func (h *Handler) Refresh(c *gin.Context) {
-	refreshToken, err := c.Cookie("refresh_token")
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": "No refresh token provided",
-		})
+	rawToken, err := c.Cookie("refresh_token")
+	if err != nil || rawToken == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"success": false, "message": "no refresh token provided"})
 		return
 	}
-
-	newAccess, newRefresh, err := h.service.Refresh(refreshToken)
+	newAccess, newRefresh, err := h.service.Refresh(rawToken)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+		apperr.Respond(c, h.log, err)
 		return
 	}
-
-	c.SetCookie(
-		"refresh_token",
-		newRefresh,
-		3600*24*7,
-		"/",
-		"",
-		true,
-		true,
-	)
-
+	h.setRefreshCookie(c, newRefresh)
 	c.JSON(http.StatusOK, gin.H{
 		"success":      true,
 		"access_token": newAccess,
-		"message":      "Tokens refreshed successfully",
+		"message":      "tokens refreshed successfully",
 	})
 }
 
-// Logout invalidates the current refresh token
+// Logout — revoke refresh token, clear cookie
 func (h *Handler) Logout(c *gin.Context) {
-	refreshToken, err := c.Cookie("refresh_token")
-	if err == nil && refreshToken != "" {
-		_ = h.service.Logout(refreshToken)
+	rawToken, err := c.Cookie("refresh_token")
+	if err == nil && rawToken != "" {
+		_ = h.service.Logout(rawToken)
 	}
-
-	c.SetCookie("refresh_token", "", -1, "/", "", true, true)
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Logged out successfully",
-	})
+	c.SetCookie("refresh_token", "", -1, "/", "", h.secure, true)
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "logged out successfully"})
 }
 
-// WhoAmI returns the authenticated user's profile
+// WhoAmI — return the authenticated user's profile
 func (h *Handler) WhoAmI(c *gin.Context) {
-	userIDVal, exists := c.Get("user_id")
-	if !exists {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "user context missing",
-		})
+	userIDVal, ok := c.Get("user_id")
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "something went wrong, please try again"})
 		return
 	}
-
 	userID, ok := userIDVal.(uuid.UUID)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "invalid user ID type",
-		})
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "something went wrong, please try again"})
 		return
 	}
-
 	isPlatform := c.GetBool("is_platform")
-
 	resp, err := h.service.WhoAmI(userID, isPlatform)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+		apperr.Respond(c, h.log, err)
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    resp,
-	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": resp})
 }
 
-// ────────────────────────────────────────────────
-// Staff Management (Owner only)
-// ────────────────────────────────────────────────
+// ── Staff management (owner only — RBAC enforced by middleware) ───────────────
 
 func (h *Handler) CreateStaff(c *gin.Context) {
-	businessIDVal, exists := c.Get("business_id")
-	if !exists {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "business context missing",
-		})
-		return
-	}
-
-	businessID, ok := businessIDVal.(uuid.UUID)
+	businessID, ok := mustBusinessID(c)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "invalid business ID type",
-		})
 		return
 	}
-
-	roleVal, exists := c.Get("role")
-	if !exists {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "role context missing",
-		})
-		return
-	}
-
-	role, ok := roleVal.(string)
-	if !ok || role != "owner" {
-		c.JSON(http.StatusForbidden, gin.H{
-			"success": false,
-			"message": "Only the business owner can add staff",
-		})
-		return
-	}
-
-	var req auth.StaffCreateRequest
+	var req svc.StaffCreateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid request body"})
 		return
 	}
-
 	if err := h.service.CreateStaff(businessID, req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+		apperr.Respond(c, h.log, err)
 		return
 	}
-
 	c.JSON(http.StatusCreated, gin.H{
 		"success": true,
-		"message": "Staff member created. They will receive an email to verify their account.",
+		"message": "staff member created — they will receive a verification email",
 	})
 }
 
 func (h *Handler) DeactivateStaff(c *gin.Context) {
-	businessIDVal, exists := c.Get("business_id")
-	if !exists {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "business context missing",
-		})
-		return
-	}
-
-	businessID, ok := businessIDVal.(uuid.UUID)
+	businessID, ok := mustBusinessID(c)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "invalid business ID type",
-		})
 		return
 	}
-
-	roleVal, exists := c.Get("role")
-	if !exists {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"success": false,
-			"message": "role context missing",
-		})
-		return
-	}
-
-	role, ok := roleVal.(string)
-	if !ok || role != "owner" {
-		c.JSON(http.StatusForbidden, gin.H{
-			"success": false,
-			"message": "Only the business owner can deactivate staff",
-		})
-		return
-	}
-
 	staffIDStr := c.Param("id")
-	if staffIDStr == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "staff id is required in the URL",
-		})
-		return
-	}
-
 	staffID, err := uuid.Parse(staffIDStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"success": false,
-			"message": "invalid staff id format",
-		})
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid staff id"})
 		return
 	}
-
 	if err := h.service.DeactivateStaff(businessID, staffID); err != nil {
-		code := http.StatusBadRequest
-		if err.Error() == "staff member not found in this business" {
-			code = http.StatusNotFound
-		}
-		c.JSON(code, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+		apperr.Respond(c, h.log, err)
 		return
 	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "staff member deactivated"})
+}
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Staff member deactivated successfully",
-	})
+// ── Internal ──────────────────────────────────────────────────────────────────
+
+func (h *Handler) setRefreshCookie(c *gin.Context, token string) {
+	c.SetCookie(
+		"refresh_token",
+		token,
+		3600*24*7, // 7 days
+		"/",
+		"",
+		h.secure,
+		true, // HttpOnly
+	)
+}
+
+// mustBusinessID extracts business_id from gin context, writing a 500 if missing.
+func mustBusinessID(c *gin.Context) (uuid.UUID, bool) {
+	v, exists := c.Get("business_id")
+	if !exists {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "something went wrong, please try again"})
+		return uuid.Nil, false
+	}
+	id, ok := v.(uuid.UUID)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "something went wrong, please try again"})
+		return uuid.Nil, false
+	}
+	return id, true
 }

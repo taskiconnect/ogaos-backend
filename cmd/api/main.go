@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	handlerAdminAuth "ogaos-backend/internal/api/handlers/admin_auth"
 	handlerAuth "ogaos-backend/internal/api/handlers/auth"
 	handlerBusiness "ogaos-backend/internal/api/handlers/business"
 	handlerCoupon "ogaos-backend/internal/api/handlers/coupon"
@@ -27,11 +28,16 @@ import (
 	handlerStore "ogaos-backend/internal/api/handlers/store"
 	handlerSubscription "ogaos-backend/internal/api/handlers/subscription"
 	handlerWebhook "ogaos-backend/internal/api/handlers/webhook"
+
 	"ogaos-backend/internal/api/routes"
 	"ogaos-backend/internal/config"
 	"ogaos-backend/internal/db"
+
 	pkgImageKit "ogaos-backend/internal/external/imagekit"
 	pkgPaystack "ogaos-backend/internal/external/paystack"
+	pkgRedis "ogaos-backend/internal/pkg/redis"
+
+	svcAdminAuth "ogaos-backend/internal/service/admin_auth"
 	svcAuth "ogaos-backend/internal/service/auth"
 	svcBusiness "ogaos-backend/internal/service/business"
 	svcCoupon "ogaos-backend/internal/service/coupon"
@@ -47,26 +53,51 @@ import (
 	svcStore "ogaos-backend/internal/service/store"
 	svcSubscription "ogaos-backend/internal/service/subscription"
 	svcUpload "ogaos-backend/internal/service/upload"
+
 	"ogaos-backend/internal/worker"
 )
 
 func main() {
-	// Load configuration
 	cfg := config.Get()
 
-	// Initialize database connection
-	db.InitDB()
-	log.Println("Database connected successfully")
+	// ───────────────────────── Logger ─────────────────────────
+	var logger *slog.Logger
+	if cfg.IsProduction() {
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	} else {
+		logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+	}
+	slog.SetDefault(logger)
 
-	// ── External clients ──────────────────────────────────────────────────────
+	logger.Info("starting ogaos backend", "env", cfg.Env)
+
+	// ───────────────────────── Database ─────────────────────────
+	db.InitDB()
+	logger.Info("database connected")
+
+	// ───────────────────────── Redis ─────────────────────────
+	redisClient, err := pkgRedis.NewClient(cfg.UpstashRedisURL)
+	if err != nil {
+		logger.Error("failed to create redis client", "error", err)
+		os.Exit(1)
+	}
+
+	if err := pkgRedis.Ping(context.Background(), redisClient); err != nil {
+		logger.Error("failed to connect to redis", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("redis connected")
+
+	// ───────────────────────── External Clients ─────────────────────────
 	ikClient := pkgImageKit.NewClient(
 		cfg.ImageKitPublicKey,
 		cfg.ImageKitPrivateKey,
 		cfg.ImageKitURLEndpoint,
 	)
+
 	paystackClient := pkgPaystack.NewClient(cfg.PaystackSecretKey)
 
-	// ── Services ──────────────────────────────────────────────────────────────
+	// ───────────────────────── Services ─────────────────────────
 	authService := svcAuth.NewAuthService(
 		db.DB,
 		[]byte(cfg.JWTSecret),
@@ -74,6 +105,15 @@ func main() {
 		cfg.JWTRefreshExpiry,
 		cfg.FrontendURL,
 	)
+
+	adminAuthService := svcAdminAuth.NewAdminAuthService(
+		db.DB,
+		[]byte(cfg.AdminJWTSecret),
+		cfg.AdminJWTExpiry,
+		cfg.AdminRefreshTTL,
+		cfg.FrontendURL,
+	)
+
 	locService := svcLocation.NewService()
 	businessSvc := svcBusiness.NewService(db.DB)
 	customerSvc := svcCustomer.NewService(db.DB)
@@ -85,35 +125,37 @@ func main() {
 	storeSvc := svcStore.NewService(db.DB)
 	recruitmentSvc := svcRecruitment.NewService(db.DB, cfg.FrontendURL)
 	digitalSvc := svcDigital.NewService(db.DB, ikClient, cfg.FrontendURL, cfg.PlatformFeePercent)
-
-	// Subscription & Coupon Services
 	couponService := svcCoupon.NewService(db.DB)
 	subscriptionSvc := svcSubscription.NewService(db.DB, cfg.FrontendURL, couponService)
-
 	uploadSvc := svcUpload.NewService(ikClient)
 
-	// ── Background workers ────────────────────────────────────────────────────
+	// ───────────────────────── Workers ─────────────────────────
 	scheduler := worker.NewScheduler(db.DB, paystackClient)
 	workerDone := make(chan struct{})
 	scheduler.Start(workerDone)
 
-	// ── HTTP handlers ─────────────────────────────────────────────────────────
-	authHandler := handlerAuth.NewHandler(authService)
+	logger.Info("background workers started")
+
+	// ───────────────────────── Handlers ─────────────────────────
+	isProd := cfg.IsProduction()
+
+	authHandler := handlerAuth.NewHandler(authService, isProd, logger)
+	adminAuthHandler := handlerAdminAuth.NewHandler(adminAuthService, isProd, logger)
+
 	healthHandler := handlerHealth.NewHandler(db.DB)
 	locationHandler := handlerLocation.NewHandler(locService)
 	businessHandler := handlerBusiness.NewHandler(businessSvc, uploadSvc)
 	customerHandler := handlerCustomer.NewHandler(customerSvc)
 	productHandler := handlerProduct.NewHandler(productSvc, uploadSvc)
-	saleHandler := handlerSale.NewHandler(saleSvc)
+	saleHandler := handlerSale.NewHandler(saleSvc, logger)
 	invoiceHandler := handlerInvoice.NewHandler(invoiceSvc)
 	expenseHandler := handlerExpense.NewHandler(expenseSvc)
 	debtHandler := handlerDebt.NewHandler(debtSvc)
 	storeHandler := handlerStore.NewHandler(storeSvc)
 	recruitmentHandler := handlerRecruitment.NewHandler(recruitmentSvc, uploadSvc)
 	digitalHandler := handlerDigital.NewHandler(digitalSvc, uploadSvc)
+	couponHandler := handlerCoupon.NewHandler(couponService, logger)
 
-	// New Handlers
-	couponHandler := handlerCoupon.NewHandler(couponService)
 	subscriptionHandler := handlerSubscription.NewHandler(
 		subscriptionSvc,
 		couponService,
@@ -129,19 +171,31 @@ func main() {
 		scheduler.Payout(),
 	)
 
-	// Set Gin mode based on environment
-	if cfg.Env == "production" {
+	// ───────────────────────── Gin ─────────────────────────
+	if isProd {
 		gin.SetMode(gin.ReleaseMode)
-	} else {
-		gin.SetMode(gin.DebugMode)
 	}
 
-	// Initialize Gin router
-	r := gin.Default()
+	r := gin.New()
+	r.Use(gin.Recovery())
 
-	// Setup all API routes
+	if !isProd {
+		r.Use(gin.Logger())
+	}
+
+	if len(cfg.TrustedProxies) > 0 {
+		if err := r.SetTrustedProxies(cfg.TrustedProxies); err != nil {
+			logger.Error("failed to set trusted proxies", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	// ───────────────────────── Routes ─────────────────────────
 	routes.SetupAuthRoutes(
-		r, cfg, db.DB,
+		r,
+		cfg,
+		db.DB,
+		redisClient,
 		authHandler,
 		healthHandler,
 		locationHandler,
@@ -158,38 +212,48 @@ func main() {
 		webhookHandler,
 		couponHandler,
 		subscriptionHandler,
+		adminAuthHandler,
 	)
 
-	// Create HTTP server with graceful shutdown
+	// ───────────────────────── Server ─────────────────────────
 	srv := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: r,
+		Addr:              ":" + cfg.Port,
+		Handler:           r,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
-	// Start server in goroutine
 	go func() {
-		log.Printf("Starting OgaOs API on :%s (%s mode)", cfg.Port, cfg.Env)
+		logger.Info("server starting",
+			"port", cfg.Port,
+			"env", cfg.Env,
+		)
+
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server failed: %v", err)
+			logger.Error("server failed", "error", err)
+			os.Exit(1)
 		}
 	}()
 
-	// Wait for interrupt signal
+	// ───────────────────────── Graceful Shutdown ─────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("Shutting down server...")
+	logger.Info("shutdown signal received")
 
-	// Stop background workers first
 	close(workerDone)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced shutdown: %v", err)
+		logger.Error("forced shutdown", "error", err)
+		os.Exit(1)
 	}
 
-	log.Println("Server exited gracefully")
+	logger.Info("server exited cleanly")
 }

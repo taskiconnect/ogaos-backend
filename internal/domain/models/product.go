@@ -1,4 +1,3 @@
-// internal/domain/models/product.go
 package models
 
 import (
@@ -13,17 +12,18 @@ const (
 )
 
 type Product struct {
-	ID          uuid.UUID  `gorm:"type:uuid;primaryKey;default:uuid_generate_v4()" json:"id"`
-	BusinessID  uuid.UUID  `gorm:"type:uuid;not null;index" json:"business_id"`
-	StoreID     *uuid.UUID `gorm:"type:uuid;index" json:"store_id"`
-	Name        string     `gorm:"size:255;not null" json:"name"`
-	Description *string    `gorm:"type:text" json:"description"`
-	Type        string     `gorm:"size:20;not null;default:'product'" json:"type"` // product | service
-	SKU         *string    `gorm:"size:100;index" json:"sku"`
-	Price       int64      `gorm:"not null" json:"price"` // in kobo
-	CostPrice   *int64     `json:"cost_price"`            // in kobo, for margin calc
-	ImageURL    *string    `gorm:"size:500" json:"image_url"`
-	// Inventory — only relevant when Type = "product"
+	ID             uuid.UUID  `gorm:"type:uuid;primaryKey;default:uuid_generate_v4()" json:"id"`
+	BusinessID     uuid.UUID  `gorm:"type:uuid;not null;index" json:"business_id"`
+	StoreID        *uuid.UUID `gorm:"type:uuid;index" json:"store_id"`
+	Name           string     `gorm:"size:255;not null" json:"name"`
+	Description    *string    `gorm:"type:text" json:"description"`
+	Type           string     `gorm:"size:20;not null;default:'product'" json:"type"`
+	SKU            *string    `gorm:"size:100;index" json:"sku"`
+	Price          int64      `gorm:"not null" json:"price"`
+	CostPrice      *int64     `json:"cost_price"`
+	ImageURL       *string    `gorm:"size:500" json:"image_url"`
+	IdempotencyKey *uuid.UUID `gorm:"type:uuid;uniqueIndex" json:"-"`
+
 	TrackInventory    bool      `gorm:"default:false" json:"track_inventory"`
 	StockQuantity     int       `gorm:"default:0" json:"stock_quantity"`
 	LowStockThreshold int       `gorm:"default:5" json:"low_stock_threshold"`
@@ -31,17 +31,14 @@ type Product struct {
 	CreatedAt         time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt         time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 
-	// Associations
 	Business Business `gorm:"foreignKey:BusinessID" json:"-"`
 	Store    *Store   `gorm:"foreignKey:StoreID" json:"-"`
 }
 
-// IsLowStock returns true if stock is at or below the low stock threshold
 func (p *Product) IsLowStock() bool {
 	return p.TrackInventory && p.StockQuantity <= p.LowStockThreshold
 }
 
-// IsOutOfStock returns true if product has no stock left
 func (p *Product) IsOutOfStock() bool {
 	return p.TrackInventory && p.StockQuantity <= 0
 }
