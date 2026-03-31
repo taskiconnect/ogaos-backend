@@ -60,7 +60,6 @@ import (
 func main() {
 	cfg := config.Get()
 
-	// ───────────────────────── Logger ─────────────────────────
 	var logger *slog.Logger
 	if cfg.IsProduction() {
 		logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -71,11 +70,9 @@ func main() {
 
 	logger.Info("starting ogaos backend", "env", cfg.Env)
 
-	// ───────────────────────── Database ─────────────────────────
 	db.InitDB()
 	logger.Info("database connected")
 
-	// ───────────────────────── Redis ─────────────────────────
 	redisClient, err := pkgRedis.NewClient(cfg.UpstashRedisURL)
 	if err != nil {
 		logger.Error("failed to create redis client", "error", err)
@@ -88,7 +85,6 @@ func main() {
 	}
 	logger.Info("redis connected")
 
-	// ───────────────────────── External Clients ─────────────────────────
 	ikClient := pkgImageKit.NewClient(
 		cfg.ImageKitPublicKey,
 		cfg.ImageKitPrivateKey,
@@ -97,7 +93,6 @@ func main() {
 
 	paystackClient := pkgPaystack.NewClient(cfg.PaystackSecretKey)
 
-	// ───────────────────────── Services ─────────────────────────
 	authService := svcAuth.NewAuthService(
 		db.DB,
 		[]byte(cfg.JWTSecret),
@@ -118,7 +113,10 @@ func main() {
 	businessSvc := svcBusiness.NewService(db.DB)
 	customerSvc := svcCustomer.NewService(db.DB)
 	productSvc := svcProduct.NewService(db.DB)
-	saleSvc := svcSale.NewService(db.DB)
+
+	receiptSender := svcSale.NewEmailReceiptSender(db.DB)
+	saleSvc := svcSale.NewService(db.DB, receiptSender)
+
 	invoiceSvc := svcInvoice.NewService(db.DB, cfg.FrontendURL)
 	expenseSvc := svcExpense.NewService(db.DB)
 	debtSvc := svcDebt.NewService(db.DB)
@@ -129,14 +127,12 @@ func main() {
 	subscriptionSvc := svcSubscription.NewService(db.DB, cfg.FrontendURL, couponService)
 	uploadSvc := svcUpload.NewService(ikClient)
 
-	// ───────────────────────── Workers ─────────────────────────
 	scheduler := worker.NewScheduler(db.DB, paystackClient)
 	workerDone := make(chan struct{})
 	scheduler.Start(workerDone)
 
 	logger.Info("background workers started")
 
-	// ───────────────────────── Handlers ─────────────────────────
 	isProd := cfg.IsProduction()
 
 	authHandler := handlerAuth.NewHandler(authService, isProd, logger)
@@ -171,7 +167,6 @@ func main() {
 		scheduler.Payout(),
 	)
 
-	// ───────────────────────── Gin ─────────────────────────
 	if isProd {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -190,7 +185,6 @@ func main() {
 		}
 	}
 
-	// ───────────────────────── Routes ─────────────────────────
 	routes.SetupAuthRoutes(
 		r,
 		cfg,
@@ -215,7 +209,6 @@ func main() {
 		adminAuthHandler,
 	)
 
-	// ───────────────────────── Server ─────────────────────────
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           r,
@@ -238,7 +231,6 @@ func main() {
 		}
 	}()
 
-	// ───────────────────────── Graceful Shutdown ─────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit

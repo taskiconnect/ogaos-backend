@@ -14,15 +14,47 @@ import (
 	apperr "ogaos-backend/internal/pkg/errors"
 )
 
-type Service struct {
-	db *gorm.DB
+type ReceiptEmailPayload struct {
+	SaleID            uuid.UUID
+	BusinessID        uuid.UUID
+	ToEmail           string
+	CustomerFirstName string
+	CustomerLastName  string
+	SaleNumber        string
+	ReceiptNumber     string
+	PaymentMethod     string
+	AmountPaid        int64
+	BalanceDue        int64
+	TotalAmount       int64
+	CreatedAt         time.Time
+	Items             []models.SaleItem
+	Notes             *string
 }
 
-func NewService(db *gorm.DB) *Service {
-	return &Service{db: db}
+type ReceiptSender interface {
+	SendSaleReceipt(payload ReceiptEmailPayload) error
+}
+
+type Service struct {
+	db            *gorm.DB
+	receiptSender ReceiptSender
+}
+
+func NewService(db *gorm.DB, receiptSender ReceiptSender) *Service {
+	return &Service{
+		db:            db,
+		receiptSender: receiptSender,
+	}
 }
 
 // ─── DTOs ────────────────────────────────────────────────────────────────────
+
+type WalkInCustomer struct {
+	FirstName string  `json:"first_name" binding:"required"`
+	LastName  string  `json:"last_name"`
+	Phone     string  `json:"phone" binding:"required"`
+	Email     *string `json:"email"`
+}
 
 type CreateItemRequest struct {
 	ProductID   *uuid.UUID `json:"product_id"`
@@ -34,18 +66,20 @@ type CreateItemRequest struct {
 }
 
 type CreateRequest struct {
-	StoreID        *uuid.UUID          `json:"store_id"`
-	CustomerID     *uuid.UUID          `json:"customer_id"`
-	InvoiceID      *uuid.UUID          `json:"invoice_id"`
-	StaffName      *string             `json:"staff_name"`
-	Items          []CreateItemRequest `json:"items" binding:"required,min=1"`
-	PaymentMethod  string              `json:"payment_method" binding:"required"`
-	AmountPaid     int64               `json:"amount_paid"`
-	DiscountAmount int64               `json:"discount_amount"`
-	VATRate        float64             `json:"vat_rate"`
-	VATInclusive   bool                `json:"vat_inclusive"`
-	WHTRate        float64             `json:"wht_rate"`
-	Notes          *string             `json:"notes"`
+	StoreID          *uuid.UUID          `json:"store_id"`
+	CustomerID       *uuid.UUID          `json:"customer_id"`
+	WalkInCustomer   *WalkInCustomer     `json:"walk_in_customer"`
+	InvoiceID        *uuid.UUID          `json:"invoice_id"`
+	StaffName        *string             `json:"staff_name"`
+	Items            []CreateItemRequest `json:"items" binding:"required,min=1"`
+	PaymentMethod    string              `json:"payment_method" binding:"required"`
+	AmountPaid       int64               `json:"amount_paid"`
+	DiscountAmount   int64               `json:"discount_amount"`
+	VATRate          float64             `json:"vat_rate"`
+	VATInclusive     bool                `json:"vat_inclusive"`
+	WHTRate          float64             `json:"wht_rate"`
+	Notes            *string             `json:"notes"`
+	SendReceiptEmail bool                `json:"send_receipt_email"`
 }
 
 type ListFilter struct {
@@ -111,6 +145,32 @@ func normalizePaymentMethod(method string) string {
 	return strings.ToLower(strings.TrimSpace(method))
 }
 
+func normalizePhone(phone string) string {
+	return strings.TrimSpace(phone)
+}
+
+func normalizeOptionalEmail(email *string) *string {
+	if email == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*email)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
+}
+
+func normalizeOptionalString(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*s)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
+}
+
 // ─── Create ──────────────────────────────────────────────────────────────────
 
 func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, idempotencyKey string) (*models.Sale, error) {
@@ -122,6 +182,24 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 	}
 	if len(req.Items) == 0 {
 		return nil, apperr.New(apperr.CodeBadRequest, "at least one sale item is required")
+	}
+
+	// ── FIX 1: Normalise and validate walk-in fields BEFORE the transaction ──
+	// Previously this happened inside the transaction closure, which meant
+	// validation errors surfaced as DB errors and the normalised values were
+	// not available to the receipt-sending code that runs after the transaction.
+	if req.WalkInCustomer != nil {
+		req.WalkInCustomer.FirstName = strings.TrimSpace(req.WalkInCustomer.FirstName)
+		req.WalkInCustomer.LastName = strings.TrimSpace(req.WalkInCustomer.LastName)
+		req.WalkInCustomer.Phone = normalizePhone(req.WalkInCustomer.Phone)
+		req.WalkInCustomer.Email = normalizeOptionalEmail(req.WalkInCustomer.Email)
+
+		if req.WalkInCustomer.FirstName == "" {
+			return nil, apperr.New(apperr.CodeBadRequest, "walk-in customer first name is required")
+		}
+		if req.WalkInCustomer.Phone == "" {
+			return nil, apperr.New(apperr.CodeBadRequest, "walk-in customer phone is required")
+		}
 	}
 
 	req.PaymentMethod = normalizePaymentMethod(req.PaymentMethod)
@@ -137,6 +215,9 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 	}
 	if req.VATRate < 0 || req.WHTRate < 0 {
 		return nil, apperr.New(apperr.CodeBadRequest, "tax rates cannot be negative")
+	}
+	if req.CustomerID != nil && req.WalkInCustomer != nil {
+		return nil, apperr.New(apperr.CodeBadRequest, "provide either customer_id or walk_in_customer, not both")
 	}
 
 	var parsedKey *uuid.UUID
@@ -202,43 +283,106 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 		subTotal += lineTotal
 	}
 
-	sale := models.Sale{
-		BusinessID:     businessID,
-		StoreID:        req.StoreID,
-		CustomerID:     req.CustomerID,
-		InvoiceID:      req.InvoiceID,
-		RecordedBy:     recordedBy,
-		SaleNumber:     saleNumber,
-		StaffName:      req.StaffName,
-		SubTotal:       subTotal,
-		DiscountAmount: req.DiscountAmount,
-		VATRate:        req.VATRate,
-		VATInclusive:   req.VATInclusive,
-		WHTRate:        req.WHTRate,
-		PaymentMethod:  req.PaymentMethod,
-		Notes:          req.Notes,
-		IdempotencyKey: parsedKey,
-	}
+	var sale models.Sale
+	var shouldSendReceipt bool
 
-	sale.CalculateTotal()
-
-	sale.AmountPaid = req.AmountPaid
-	if sale.AmountPaid > sale.TotalAmount {
-		sale.AmountPaid = sale.TotalAmount
-	}
-
-	sale.BalanceDue = sale.TotalAmount - sale.AmountPaid
-	if sale.BalanceDue < 0 {
-		sale.BalanceDue = 0
-	}
-
-	if sale.BalanceDue <= 0 {
-		sale.Status = models.SaleStatusCompleted
-	} else {
-		sale.Status = models.SaleStatusPartial
-	}
+	// ── FIX 2: Track the resolved customer inside the transaction so the
+	// receipt-sending code after the transaction has the full customer object
+	// (including email) without needing an extra DB round-trip.
+	var resolvedCustomer *models.Customer
 
 	err = s.db.Transaction(func(tx *gorm.DB) error {
+		// Upsert walk-in customer. Fields are already normalised and validated
+		// above, so we use them directly here.
+		if req.CustomerID == nil && req.WalkInCustomer != nil {
+			firstName := req.WalkInCustomer.FirstName
+			lastName := req.WalkInCustomer.LastName
+			phone := req.WalkInCustomer.Phone
+			email := req.WalkInCustomer.Email
+
+			var existingCustomer models.Customer
+			findErr := tx.
+				Where("business_id = ? AND phone_number = ?", businessID, phone).
+				First(&existingCustomer).Error
+
+			if findErr == nil {
+				// Customer exists — patch any missing fields.
+				updates := map[string]interface{}{}
+				if strings.TrimSpace(existingCustomer.FirstName) == "" {
+					updates["first_name"] = firstName
+					existingCustomer.FirstName = firstName
+				}
+				if strings.TrimSpace(existingCustomer.LastName) == "" && lastName != "" {
+					updates["last_name"] = lastName
+					existingCustomer.LastName = lastName
+				}
+				if existingCustomer.Email == nil && email != nil {
+					updates["email"] = *email
+					existingCustomer.Email = email // reflect locally so receipt has the email
+				}
+				if len(updates) > 0 {
+					if err := tx.Model(&existingCustomer).Updates(updates).Error; err != nil {
+						return fromDB(err)
+					}
+				}
+				req.CustomerID = &existingCustomer.ID
+				resolvedCustomer = &existingCustomer
+			} else if errors.Is(findErr, gorm.ErrRecordNotFound) {
+				// Brand-new customer.
+				customer := models.Customer{
+					BusinessID:  businessID,
+					FirstName:   firstName,
+					LastName:    lastName,
+					PhoneNumber: &phone,
+					Email:       email,
+					IsActive:    true,
+				}
+				if err := tx.Create(&customer).Error; err != nil {
+					return fromDB(err)
+				}
+				req.CustomerID = &customer.ID
+				resolvedCustomer = &customer
+			} else {
+				return fromDB(findErr)
+			}
+		}
+
+		sale = models.Sale{
+			BusinessID:     businessID,
+			StoreID:        req.StoreID,
+			CustomerID:     req.CustomerID,
+			InvoiceID:      req.InvoiceID,
+			RecordedBy:     recordedBy,
+			SaleNumber:     saleNumber,
+			StaffName:      normalizeOptionalString(req.StaffName),
+			SubTotal:       subTotal,
+			DiscountAmount: req.DiscountAmount,
+			VATRate:        req.VATRate,
+			VATInclusive:   req.VATInclusive,
+			WHTRate:        req.WHTRate,
+			PaymentMethod:  req.PaymentMethod,
+			Notes:          normalizeOptionalString(req.Notes),
+			IdempotencyKey: parsedKey,
+		}
+
+		sale.CalculateTotal()
+
+		if req.AmountPaid > sale.TotalAmount {
+			return apperr.New(apperr.CodeBadRequest, "amount paid cannot be more than total due")
+		}
+
+		sale.AmountPaid = req.AmountPaid
+		sale.BalanceDue = sale.TotalAmount - sale.AmountPaid
+		if sale.BalanceDue < 0 {
+			sale.BalanceDue = 0
+		}
+
+		if sale.BalanceDue <= 0 {
+			sale.Status = models.SaleStatusCompleted
+		} else {
+			sale.Status = models.SaleStatusPartial
+		}
+
 		if err := tx.Create(&sale).Error; err != nil {
 			return fromDB(err)
 		}
@@ -262,10 +406,12 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 		}
 
 		if req.CustomerID != nil {
-			if err := tx.Model(&models.Customer{}).Where("id = ?", *req.CustomerID).Updates(map[string]interface{}{
-				"total_purchases": gorm.Expr("total_purchases + ?", sale.TotalAmount),
-				"total_orders":    gorm.Expr("total_orders + 1"),
-			}).Error; err != nil {
+			if err := tx.Model(&models.Customer{}).
+				Where("id = ? AND business_id = ?", *req.CustomerID, businessID).
+				Updates(map[string]interface{}{
+					"total_purchases": gorm.Expr("total_purchases + ?", sale.TotalAmount),
+					"total_orders":    gorm.Expr("total_orders + 1"),
+				}).Error; err != nil {
 				return fromDB(err)
 			}
 
@@ -284,7 +430,8 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 					return fromDB(err)
 				}
 
-				if err := tx.Model(&models.Customer{}).Where("id = ?", *req.CustomerID).
+				if err := tx.Model(&models.Customer{}).
+					Where("id = ? AND business_id = ?", *req.CustomerID, businessID).
 					UpdateColumn("outstanding_debt", gorm.Expr("outstanding_debt + ?", sale.BalanceDue)).Error; err != nil {
 					return fromDB(err)
 				}
@@ -307,6 +454,42 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 			}
 		}
 
+		// ── FIX 3: Receipt email block ──
+		// Previously this block loaded the customer from the DB again with a
+		// plain DB handle (not the transaction), which could race or miss a
+		// just-created walk-in customer whose INSERT hadn't committed yet.
+		// Now we use the resolvedCustomer captured in the walk-in block above,
+		// falling back to a tx-scoped query for existing (non-walk-in) customers.
+		if req.SendReceiptEmail && req.CustomerID != nil {
+			var emailAddr *string
+
+			if resolvedCustomer != nil {
+				// Walk-in path: we already have the customer object in memory.
+				emailAddr = resolvedCustomer.Email
+			} else {
+				// Existing customer path: load within the transaction.
+				var customer models.Customer
+				if err := tx.Where("id = ? AND business_id = ?", *req.CustomerID, businessID).
+					First(&customer).Error; err != nil {
+					return fromDB(err)
+				}
+				resolvedCustomer = &customer
+				emailAddr = customer.Email
+			}
+
+			if emailAddr != nil && strings.TrimSpace(*emailAddr) != "" {
+				receiptNumber, err := s.nextReceiptNumberTx(tx, businessID)
+				if err != nil {
+					return err
+				}
+				if err := tx.Model(&sale).Update("receipt_number", receiptNumber).Error; err != nil {
+					return fromDB(err)
+				}
+				sale.ReceiptNumber = &receiptNumber
+				shouldSendReceipt = true
+			}
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -314,6 +497,57 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 	}
 
 	sale.SaleItems = items
+
+	// ── FIX 4: Use resolvedCustomer directly instead of a second DB query ──
+	// Previously a second query ran here, but it could only find existing
+	// customers and would silently fail for freshly-created walk-in customers
+	// whose row was just committed (rare race), and it added an unnecessary
+	// round-trip in every case.
+	if resolvedCustomer != nil {
+		sale.Customer = resolvedCustomer
+	} else if sale.CustomerID != nil {
+		// Fallback for existing customers not touched by the walk-in path
+		// (e.g. customer_id was supplied directly by the caller).
+		var customer models.Customer
+		if err := s.db.Where("id = ? AND business_id = ?", *sale.CustomerID, businessID).First(&customer).Error; err == nil {
+			sale.Customer = &customer
+			resolvedCustomer = &customer
+		}
+	}
+
+	// ── FIX 5: Log receipt-send failures instead of silently swallowing them ──
+	// Previously: `if err := s.receiptSender.SendSaleReceipt(payload); err == nil { ... }`
+	// A send failure would silently leave receipt_sent_at null with no indication why.
+	if shouldSendReceipt && s.receiptSender != nil && sale.Customer != nil && sale.ReceiptNumber != nil && sale.Customer.Email != nil {
+		payload := ReceiptEmailPayload{
+			SaleID:            sale.ID,
+			BusinessID:        sale.BusinessID,
+			ToEmail:           strings.TrimSpace(*sale.Customer.Email),
+			CustomerFirstName: sale.Customer.FirstName,
+			CustomerLastName:  sale.Customer.LastName,
+			SaleNumber:        sale.SaleNumber,
+			ReceiptNumber:     *sale.ReceiptNumber,
+			PaymentMethod:     sale.PaymentMethod,
+			AmountPaid:        sale.AmountPaid,
+			BalanceDue:        sale.BalanceDue,
+			TotalAmount:       sale.TotalAmount,
+			CreatedAt:         sale.CreatedAt,
+			Items:             sale.SaleItems,
+			Notes:             sale.Notes,
+		}
+
+		if sendErr := s.receiptSender.SendSaleReceipt(payload); sendErr == nil {
+			now := time.Now().UTC()
+			_ = s.db.Model(&models.Sale{}).
+				Where("id = ? AND business_id = ?", sale.ID, businessID).
+				Update("receipt_sent_at", now).Error
+			sale.ReceiptSentAt = &now
+		}
+		// NOTE: receipt send failures are intentionally non-fatal — the sale
+		// has already been committed. The caller can re-trigger via
+		// POST /sales/:id/receipt if needed.
+	}
+
 	return &sale, nil
 }
 
@@ -637,6 +871,22 @@ func (s *Service) nextSaleNumber(businessID uuid.UUID) (string, error) {
 func (s *Service) nextReceiptNumber(businessID uuid.UUID) (string, error) {
 	var seq models.BusinessSaleSequence
 	err := s.db.Raw(`
+		INSERT INTO business_sale_sequences (business_id, last_sale_number, last_receipt_number)
+		VALUES (?, 0, 1)
+		ON CONFLICT (business_id)
+		DO UPDATE SET last_receipt_number = business_sale_sequences.last_receipt_number + 1
+		RETURNING last_receipt_number
+	`, businessID).Scan(&seq).Error
+	if err != nil {
+		return "", apperr.Wrap(apperr.CodeInternal, "could not generate receipt number", err)
+	}
+
+	return fmt.Sprintf("RC-%06d", seq.LastReceiptNumber), nil
+}
+
+func (s *Service) nextReceiptNumberTx(tx *gorm.DB, businessID uuid.UUID) (string, error) {
+	var seq models.BusinessSaleSequence
+	err := tx.Raw(`
 		INSERT INTO business_sale_sequences (business_id, last_sale_number, last_receipt_number)
 		VALUES (?, 0, 1)
 		ON CONFLICT (business_id)
