@@ -118,7 +118,9 @@ func fromDB(err error) error {
 		switch pgErr.Code {
 		case "23505":
 			switch pgErr.ConstraintName {
-			case "sales_sale_number_key":
+			// Updated: constraint is now the composite per-business index
+			// (migration 013) rather than the old global unique constraint.
+			case "idx_sales_business_sale_number":
 				return apperr.Wrap(
 					apperr.CodeConflict,
 					"This sale appears to have already been recorded. Please refresh and check your sales list.",
@@ -184,10 +186,9 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 		return nil, apperr.New(apperr.CodeBadRequest, "at least one sale item is required")
 	}
 
-	// ── FIX 1: Normalise and validate walk-in fields BEFORE the transaction ──
-	// Previously this happened inside the transaction closure, which meant
-	// validation errors surfaced as DB errors and the normalised values were
-	// not available to the receipt-sending code that runs after the transaction.
+	// Normalise and validate walk-in fields BEFORE the transaction so that
+	// validation errors surface cleanly and normalised values are available
+	// to the receipt-sending code that runs after the transaction.
 	if req.WalkInCustomer != nil {
 		req.WalkInCustomer.FirstName = strings.TrimSpace(req.WalkInCustomer.FirstName)
 		req.WalkInCustomer.LastName = strings.TrimSpace(req.WalkInCustomer.LastName)
@@ -244,10 +245,14 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 		}
 	}
 
-	saleNumber, err := s.nextSaleNumber(businessID)
-	if err != nil {
-		return nil, err
-	}
+	// ── NOTE: sale number is now generated INSIDE the transaction below ───────
+	// Previously nextSaleNumber() was called here (outside the transaction).
+	// That meant a failed tx.Create(&sale) would permanently increment the
+	// sequence counter even though no sale was saved, causing drift and eventual
+	// duplicate key errors across businesses. Moving it inside the transaction
+	// makes the increment atomic with the insert — if the insert rolls back,
+	// the sequence increment rolls back too.
+	// ─────────────────────────────────────────────────────────────────────────
 
 	var items []models.SaleItem
 	var subTotal int64
@@ -285,13 +290,9 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 
 	var sale models.Sale
 	var shouldSendReceipt bool
-
-	// ── FIX 2: Track the resolved customer inside the transaction so the
-	// receipt-sending code after the transaction has the full customer object
-	// (including email) without needing an extra DB round-trip.
 	var resolvedCustomer *models.Customer
 
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	err := s.db.Transaction(func(tx *gorm.DB) error {
 		// Upsert walk-in customer. Fields are already normalised and validated
 		// above, so we use them directly here.
 		if req.CustomerID == nil && req.WalkInCustomer != nil {
@@ -318,7 +319,7 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 				}
 				if existingCustomer.Email == nil && email != nil {
 					updates["email"] = *email
-					existingCustomer.Email = email // reflect locally so receipt has the email
+					existingCustomer.Email = email
 				}
 				if len(updates) > 0 {
 					if err := tx.Model(&existingCustomer).Updates(updates).Error; err != nil {
@@ -346,6 +347,15 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 				return fromDB(findErr)
 			}
 		}
+
+		// ── Generate sale number INSIDE the transaction ───────────────────────
+		// This is the key fix: if tx.Create(&sale) fails below, this increment
+		// is rolled back atomically. No more sequence drift between businesses.
+		saleNumber, err := s.nextSaleNumberTx(tx, businessID)
+		if err != nil {
+			return err
+		}
+		// ─────────────────────────────────────────────────────────────────────
 
 		sale = models.Sale{
 			BusinessID:     businessID,
@@ -454,20 +464,14 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 			}
 		}
 
-		// ── FIX 3: Receipt email block ──
-		// Previously this block loaded the customer from the DB again with a
-		// plain DB handle (not the transaction), which could race or miss a
-		// just-created walk-in customer whose INSERT hadn't committed yet.
-		// Now we use the resolvedCustomer captured in the walk-in block above,
-		// falling back to a tx-scoped query for existing (non-walk-in) customers.
+		// Receipt email block — uses resolvedCustomer captured in the walk-in
+		// block above, falling back to a tx-scoped query for existing customers.
 		if req.SendReceiptEmail && req.CustomerID != nil {
 			var emailAddr *string
 
 			if resolvedCustomer != nil {
-				// Walk-in path: we already have the customer object in memory.
 				emailAddr = resolvedCustomer.Email
 			} else {
-				// Existing customer path: load within the transaction.
 				var customer models.Customer
 				if err := tx.Where("id = ? AND business_id = ?", *req.CustomerID, businessID).
 					First(&customer).Error; err != nil {
@@ -498,16 +502,9 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 
 	sale.SaleItems = items
 
-	// ── FIX 4: Use resolvedCustomer directly instead of a second DB query ──
-	// Previously a second query ran here, but it could only find existing
-	// customers and would silently fail for freshly-created walk-in customers
-	// whose row was just committed (rare race), and it added an unnecessary
-	// round-trip in every case.
 	if resolvedCustomer != nil {
 		sale.Customer = resolvedCustomer
 	} else if sale.CustomerID != nil {
-		// Fallback for existing customers not touched by the walk-in path
-		// (e.g. customer_id was supplied directly by the caller).
 		var customer models.Customer
 		if err := s.db.Where("id = ? AND business_id = ?", *sale.CustomerID, businessID).First(&customer).Error; err == nil {
 			sale.Customer = &customer
@@ -515,9 +512,6 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 		}
 	}
 
-	// ── FIX 5: Log receipt-send failures instead of silently swallowing them ──
-	// Previously: `if err := s.receiptSender.SendSaleReceipt(payload); err == nil { ... }`
-	// A send failure would silently leave receipt_sent_at null with no indication why.
 	if shouldSendReceipt && s.receiptSender != nil && sale.Customer != nil && sale.ReceiptNumber != nil && sale.Customer.Email != nil {
 		payload := ReceiptEmailPayload{
 			SaleID:            sale.ID,
@@ -543,9 +537,8 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest, id
 				Update("receipt_sent_at", now).Error
 			sale.ReceiptSentAt = &now
 		}
-		// NOTE: receipt send failures are intentionally non-fatal — the sale
-		// has already been committed. The caller can re-trigger via
-		// POST /sales/:id/receipt if needed.
+		// Receipt send failures are intentionally non-fatal — the sale has
+		// already committed. Re-trigger via POST /sales/:id/receipt if needed.
 	}
 
 	return &sale, nil
@@ -851,10 +844,16 @@ func (s *Service) GenerateReceipt(businessID, saleID uuid.UUID) (*models.Sale, e
 }
 
 // ─── Sequence helpers ─────────────────────────────────────────────────────────
+// Rule: always use the Tx variants inside transactions so that a failed INSERT
+// rolls back the sequence increment atomically. The non-Tx variants are only
+// for callers that run outside a transaction (e.g. GenerateReceipt).
 
-func (s *Service) nextSaleNumber(businessID uuid.UUID) (string, error) {
+// nextSaleNumberTx increments and returns the next sale number for the given
+// business, scoped to the supplied transaction. If the surrounding transaction
+// rolls back, this increment is also rolled back — no sequence drift.
+func (s *Service) nextSaleNumberTx(tx *gorm.DB, businessID uuid.UUID) (string, error) {
 	var seq models.BusinessSaleSequence
-	err := s.db.Raw(`
+	err := tx.Raw(`
 		INSERT INTO business_sale_sequences (business_id, last_sale_number, last_receipt_number)
 		VALUES (?, 1, 0)
 		ON CONFLICT (business_id)
@@ -864,26 +863,11 @@ func (s *Service) nextSaleNumber(businessID uuid.UUID) (string, error) {
 	if err != nil {
 		return "", apperr.Wrap(apperr.CodeInternal, "could not generate sale number", err)
 	}
-
 	return fmt.Sprintf("SL-%06d", seq.LastSaleNumber), nil
 }
 
-func (s *Service) nextReceiptNumber(businessID uuid.UUID) (string, error) {
-	var seq models.BusinessSaleSequence
-	err := s.db.Raw(`
-		INSERT INTO business_sale_sequences (business_id, last_sale_number, last_receipt_number)
-		VALUES (?, 0, 1)
-		ON CONFLICT (business_id)
-		DO UPDATE SET last_receipt_number = business_sale_sequences.last_receipt_number + 1
-		RETURNING last_receipt_number
-	`, businessID).Scan(&seq).Error
-	if err != nil {
-		return "", apperr.Wrap(apperr.CodeInternal, "could not generate receipt number", err)
-	}
-
-	return fmt.Sprintf("RC-%06d", seq.LastReceiptNumber), nil
-}
-
+// nextReceiptNumberTx increments and returns the next receipt number for the
+// given business, scoped to the supplied transaction.
 func (s *Service) nextReceiptNumberTx(tx *gorm.DB, businessID uuid.UUID) (string, error) {
 	var seq models.BusinessSaleSequence
 	err := tx.Raw(`
@@ -896,6 +880,21 @@ func (s *Service) nextReceiptNumberTx(tx *gorm.DB, businessID uuid.UUID) (string
 	if err != nil {
 		return "", apperr.Wrap(apperr.CodeInternal, "could not generate receipt number", err)
 	}
+	return fmt.Sprintf("RC-%06d", seq.LastReceiptNumber), nil
+}
 
+// nextReceiptNumber is used by GenerateReceipt which runs outside a transaction.
+func (s *Service) nextReceiptNumber(businessID uuid.UUID) (string, error) {
+	var seq models.BusinessSaleSequence
+	err := s.db.Raw(`
+		INSERT INTO business_sale_sequences (business_id, last_sale_number, last_receipt_number)
+		VALUES (?, 0, 1)
+		ON CONFLICT (business_id)
+		DO UPDATE SET last_receipt_number = business_sale_sequences.last_receipt_number + 1
+		RETURNING last_receipt_number
+	`, businessID).Scan(&seq).Error
+	if err != nil {
+		return "", apperr.Wrap(apperr.CodeInternal, "could not generate receipt number", err)
+	}
 	return fmt.Sprintf("RC-%06d", seq.LastReceiptNumber), nil
 }
