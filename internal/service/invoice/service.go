@@ -4,6 +4,7 @@ package invoice
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +24,31 @@ func NewService(db *gorm.DB, frontendURL string) *Service {
 	return &Service{db: db, frontendURL: frontendURL}
 }
 
+// ─── DateOnly ────────────────────────────────────────────────────────────────
+// Accepts "YYYY-MM-DD" from HTML date inputs as well as full RFC-3339 strings.
+// This avoids the `parsing time "2026-04-03" as "…T…"` error.
+
+type DateOnly struct{ time.Time }
+
+func (d *DateOnly) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(string(b), `"`)
+	if s == "null" || s == "" {
+		return nil
+	}
+	// Try full RFC-3339 first so existing clients keep working.
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		d.Time = t
+		return nil
+	}
+	// Fall back to plain date.
+	t, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		return fmt.Errorf("date must be YYYY-MM-DD or RFC-3339, got %q", s)
+	}
+	d.Time = t
+	return nil
+}
+
 // ─── DTOs ────────────────────────────────────────────────────────────────────
 
 type InvoiceItemInput struct {
@@ -37,7 +63,8 @@ type InvoiceItemInput struct {
 type CreateRequest struct {
 	StoreID        *uuid.UUID         `json:"store_id"`
 	CustomerID     *uuid.UUID         `json:"customer_id"`
-	DueDate        time.Time          `json:"due_date" binding:"required"`
+	IssueDate      *DateOnly          `json:"issue_date"` // optional; defaults to now
+	DueDate        DateOnly           `json:"due_date" binding:"required"`
 	Items          []InvoiceItemInput `json:"items" binding:"required,min=1"`
 	DiscountAmount int64              `json:"discount_amount"`
 	VATRate        float64            `json:"vat_rate"`
@@ -55,6 +82,12 @@ type ListFilter struct {
 	Cursor     string
 	Limit      int
 }
+
+// ─── Sentinel errors ──────────────────────────────────────────────────────────
+
+// ErrNotFound is returned when an invoice does not exist or belongs to a
+// different business. The handler maps this to a 404; all other errors → 500.
+var ErrNotFound = errors.New("invoice not found")
 
 // ─── Methods ─────────────────────────────────────────────────────────────────
 
@@ -80,14 +113,19 @@ func (s *Service) Create(businessID, createdBy uuid.UUID, req CreateRequest) (*m
 		subTotal += lineTotal
 	}
 
+	issueDate := time.Now()
+	if req.IssueDate != nil && !req.IssueDate.IsZero() {
+		issueDate = req.IssueDate.Time
+	}
+
 	inv := models.Invoice{
 		BusinessID:     businessID,
 		StoreID:        req.StoreID,
 		CustomerID:     req.CustomerID,
 		CreatedBy:      createdBy,
 		InvoiceNumber:  invoiceNumber,
-		IssueDate:      time.Now(),
-		DueDate:        req.DueDate,
+		IssueDate:      issueDate,
+		DueDate:        req.DueDate.Time,
 		SubTotal:       subTotal,
 		DiscountAmount: req.DiscountAmount,
 		VATRate:        req.VATRate,
@@ -97,8 +135,8 @@ func (s *Service) Create(businessID, createdBy uuid.UUID, req CreateRequest) (*m
 		Notes:          req.Notes,
 		Status:         models.InvoiceStatusDraft,
 	}
-	inv.CalculateVAT()
-	inv.CalculateWHT()
+	// FIX: call CalculateTotal once — it calls CalculateVAT/CalculateWHT internally.
+	// Previously CalculateVAT+CalculateWHT were called separately AND inside CalculateTotal.
 	inv.CalculateTotal()
 
 	err = s.db.Transaction(func(tx *gorm.DB) error {
@@ -123,8 +161,11 @@ func (s *Service) Get(businessID, invoiceID uuid.UUID) (*models.Invoice, error) 
 		Preload("InvoiceItems").
 		Preload("Customer").
 		First(&inv).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
 	if err != nil {
-		return nil, errors.New("invoice not found")
+		return nil, err
 	}
 	return &inv, nil
 }
@@ -175,24 +216,28 @@ func (s *Service) Send(businessID, invoiceID uuid.UUID) (*models.Invoice, error)
 	var inv models.Invoice
 	if err := s.db.Where("id = ? AND business_id = ?", invoiceID, businessID).
 		Preload("Customer").Preload("Business").First(&inv).Error; err != nil {
-		return nil, errors.New("invoice not found")
+		return nil, ErrNotFound
 	}
 	if inv.Status == models.InvoiceStatusCancelled {
 		return nil, errors.New("cannot send a cancelled invoice")
 	}
 
 	now := time.Now()
-	s.db.Model(&inv).Updates(map[string]interface{}{
+	// FIX: error was silently discarded before.
+	if err := s.db.Model(&inv).Updates(map[string]interface{}{
 		"status":  models.InvoiceStatusSent,
 		"sent_at": now,
-	})
+	}).Error; err != nil {
+		return nil, err
+	}
 	inv.Status = models.InvoiceStatusSent
 	inv.SentAt = &now
 
-	// Email the customer if we have their address
+	// FIX: fire email in a goroutine — a slow/failing mail server no longer
+	// blocks the HTTP response.
 	if inv.Customer != nil && inv.Customer.Email != nil {
 		viewURL := fmt.Sprintf("%s/invoices/%s", s.frontendURL, inv.ID)
-		email.SendInvoice(
+		go email.SendInvoice(
 			*inv.Customer.Email,
 			inv.Customer.FirstName+" "+inv.Customer.LastName,
 			inv.Business.Name,
@@ -204,11 +249,11 @@ func (s *Service) Send(businessID, invoiceID uuid.UUID) (*models.Invoice, error)
 	return &inv, nil
 }
 
-// RecordPayment records a payment against an invoice, updates status.
+// RecordPayment records a payment against an invoice and updates its status.
 func (s *Service) RecordPayment(businessID, invoiceID uuid.UUID, amountPaid int64) (*models.Invoice, error) {
 	var inv models.Invoice
 	if err := s.db.Where("id = ? AND business_id = ?", invoiceID, businessID).First(&inv).Error; err != nil {
-		return nil, errors.New("invoice not found")
+		return nil, ErrNotFound
 	}
 	if inv.Status == models.InvoiceStatusCancelled {
 		return nil, errors.New("cannot record payment on a cancelled invoice")
@@ -234,21 +279,27 @@ func (s *Service) RecordPayment(businessID, invoiceID uuid.UUID, amountPaid int6
 		updates["status"] = models.InvoiceStatusPartial
 	}
 
-	s.db.Model(&inv).Updates(updates)
+	// FIX: error was silently discarded before.
+	if err := s.db.Model(&inv).Updates(updates).Error; err != nil {
+		return nil, err
+	}
 	return &inv, nil
 }
 
-// Cancel cancels a draft or sent invoice.
+// Cancel cancels a draft, sent, or overdue invoice.
 func (s *Service) Cancel(businessID, invoiceID uuid.UUID) error {
 	result := s.db.Model(&models.Invoice{}).
 		Where("id = ? AND business_id = ? AND status IN ?", invoiceID, businessID, []string{
 			models.InvoiceStatusDraft, models.InvoiceStatusSent, models.InvoiceStatusOverdue,
 		}).
 		Update("status", models.InvoiceStatusCancelled)
+	if result.Error != nil {
+		return result.Error
+	}
 	if result.RowsAffected == 0 {
 		return errors.New("invoice not found or cannot be cancelled in its current state")
 	}
-	return result.Error
+	return nil
 }
 
 // MarkOverdue updates all sent invoices past their due date to overdue.
@@ -261,6 +312,10 @@ func (s *Service) MarkOverdue() error {
 
 // ─── Number generation ────────────────────────────────────────────────────────
 
+// nextInvoiceNumber generates the next sequential invoice number for the
+// business in the current month, e.g. INV-202604-0001.
+// NOTE: this is still an optimistic read-then-write. The unique index on
+// invoice_number will reject true duplicates; callers should retry on conflict.
 func (s *Service) nextInvoiceNumber(businessID uuid.UUID) (string, error) {
 	prefix := fmt.Sprintf("INV-%s-", time.Now().Format("200601"))
 	var last models.Invoice

@@ -27,6 +27,7 @@ type CreateRequest struct {
 	Description       *string    `json:"description"`
 	Type              string     `json:"type" binding:"required"` // product | service
 	SKU               *string    `json:"sku"`
+	Barcode           *string    `json:"barcode"`
 	Price             int64      `json:"price" binding:"required,min=1"`
 	CostPrice         *int64     `json:"cost_price"`
 	StoreID           *uuid.UUID `json:"store_id"`
@@ -39,6 +40,7 @@ type UpdateRequest struct {
 	Name              *string    `json:"name"`
 	Description       *string    `json:"description"`
 	SKU               *string    `json:"sku"`
+	Barcode           *string    `json:"barcode"`
 	Price             *int64     `json:"price"`
 	CostPrice         *int64     `json:"cost_price"`
 	StoreID           *uuid.UUID `json:"store_id"`
@@ -99,6 +101,7 @@ func (s *Service) Create(businessID uuid.UUID, req CreateRequest, idempotencyKey
 		Description:       req.Description,
 		Type:              req.Type,
 		SKU:               req.SKU,
+		Barcode:           req.Barcode,
 		Price:             req.Price,
 		CostPrice:         req.CostPrice,
 		TrackInventory:    req.TrackInventory,
@@ -179,6 +182,9 @@ func (s *Service) Update(businessID, productID uuid.UUID, req UpdateRequest) (*m
 	if req.SKU != nil {
 		updates["sku"] = *req.SKU
 	}
+	if req.Barcode != nil {
+		updates["barcode"] = *req.Barcode
+	}
 	if req.Price != nil {
 		updates["price"] = *req.Price
 	}
@@ -242,4 +248,30 @@ func (s *Service) Delete(businessID, productID uuid.UUID) error {
 		return errors.New("product not found")
 	}
 	return result.Error
+}
+
+// GetByBarcode is used by the POS scanner and frontend store.
+func (s *Service) GetByBarcode(businessID uuid.UUID, barcode string) (*models.Product, error) {
+	var p models.Product
+	if err := s.db.
+		Where("business_id = ? AND barcode = ? AND is_active = true", businessID, barcode).
+		First(&p).Error; err != nil {
+		return nil, errors.New("product not found")
+	}
+	return &p, nil
+}
+
+// ListForFrontStore returns products with all fields needed by the customer-facing frontend store.
+func (s *Service) ListForFrontStore(businessID uuid.UUID, storeID *uuid.UUID) ([]models.Product, error) {
+	q := s.db.Model(&models.Product{}).
+		Where("business_id = ? AND is_active = true", businessID)
+	if storeID != nil {
+		q = q.Where("store_id = ?", *storeID)
+	}
+
+	var products []models.Product
+	if err := q.Order("name ASC").Find(&products).Error; err != nil {
+		return nil, err
+	}
+	return products, nil
 }

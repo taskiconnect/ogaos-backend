@@ -1,9 +1,8 @@
-// internal/domain/models/keyword.go
 package models
 
 import "github.com/google/uuid"
 
-// Keyword is a single normalised tag (always lowercase, trimmed).
+// Keyword is a single normalised tag (trimmed and title-cased).
 type Keyword struct {
 	ID   int64  `gorm:"primaryKey;autoIncrement" json:"id"`
 	Name string `gorm:"uniqueIndex;size:80;not null" json:"name"`

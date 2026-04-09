@@ -13,7 +13,7 @@ const (
 
 type Product struct {
 	ID             uuid.UUID  `gorm:"type:uuid;primaryKey;default:uuid_generate_v4()" json:"id"`
-	BusinessID     uuid.UUID  `gorm:"type:uuid;not null;index" json:"business_id"`
+	BusinessID     uuid.UUID  `gorm:"type:uuid;not null;index;uniqueIndex:idx_business_barcode" json:"business_id"`
 	StoreID        *uuid.UUID `gorm:"type:uuid;index" json:"store_id"`
 	Name           string     `gorm:"size:255;not null" json:"name"`
 	Description    *string    `gorm:"type:text" json:"description"`
@@ -22,6 +22,7 @@ type Product struct {
 	Price          int64      `gorm:"not null" json:"price"`
 	CostPrice      *int64     `json:"cost_price"`
 	ImageURL       *string    `gorm:"size:500" json:"image_url"`
+	Barcode        *string    `gorm:"size:100;uniqueIndex:idx_business_barcode" json:"barcode"`
 	IdempotencyKey *uuid.UUID `gorm:"type:uuid;uniqueIndex" json:"-"`
 
 	TrackInventory    bool      `gorm:"default:false" json:"track_inventory"`

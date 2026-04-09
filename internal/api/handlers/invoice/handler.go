@@ -2,6 +2,8 @@
 package invoice
 
 import (
+	"errors"
+
 	"github.com/gin-gonic/gin"
 
 	"ogaos-backend/internal/api/handlers/shared"
@@ -54,7 +56,13 @@ func (h *Handler) Get(c *gin.Context) {
 	}
 	inv, err := h.service.Get(shared.MustBusinessID(c), id)
 	if err != nil {
-		response.NotFound(c, err.Error())
+		// FIX: distinguish not-found from internal errors so DB failures
+		// don't masquerade as 404s.
+		if errors.Is(err, svcInvoice.ErrNotFound) {
+			response.NotFound(c, err.Error())
+		} else {
+			response.InternalError(c, err.Error())
+		}
 		return
 	}
 	response.OK(c, inv)

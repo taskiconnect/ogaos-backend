@@ -1,4 +1,3 @@
-// internal/service/debt/service.go
 package debt
 
 import (
@@ -53,9 +52,11 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 	if req.Direction != models.DebtDirectionReceivable && req.Direction != models.DebtDirectionPayable {
 		return nil, errors.New("direction must be 'receivable' or 'payable'")
 	}
+
 	if req.Direction == models.DebtDirectionReceivable && req.CustomerID == nil {
 		return nil, errors.New("customer_id is required for receivable debts")
 	}
+
 	if req.Direction == models.DebtDirectionPayable && req.SupplierName == nil {
 		return nil, errors.New("supplier_name is required for payable debts")
 	}
@@ -76,13 +77,16 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 		Status:        models.DebtStatusOutstanding,
 	}
 
+	d.UpdateStatus()
+
 	if err := s.db.Create(&d).Error; err != nil {
 		return nil, err
 	}
 
 	// Update customer's outstanding debt counter
 	if req.CustomerID != nil && req.Direction == models.DebtDirectionReceivable {
-		s.db.Model(&models.Customer{}).Where("id = ?", *req.CustomerID).
+		s.db.Model(&models.Customer{}).
+			Where("id = ?", *req.CustomerID).
 			UpdateColumn("outstanding_debt", gorm.Expr("outstanding_debt + ?", req.TotalAmount))
 	}
 
@@ -92,7 +96,8 @@ func (s *Service) Create(businessID, recordedBy uuid.UUID, req CreateRequest) (*
 func (s *Service) Get(businessID, debtID uuid.UUID) (*models.Debt, error) {
 	var d models.Debt
 	if err := s.db.Where("id = ? AND business_id = ?", debtID, businessID).
-		Preload("Customer").First(&d).Error; err != nil {
+		Preload("Customer").
+		First(&d).Error; err != nil {
 		return nil, errors.New("debt not found")
 	}
 	return &d, nil
@@ -104,17 +109,25 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Debt, 
 	}
 
 	q := s.db.Model(&models.Debt{}).Where("business_id = ?", businessID)
+
 	if filter.Direction != "" {
 		q = q.Where("direction = ?", filter.Direction)
 	}
+
 	if filter.Status != "" {
 		q = q.Where("status = ?", filter.Status)
 	}
+
 	if filter.CustomerID != nil {
 		q = q.Where("customer_id = ?", *filter.CustomerID)
 	}
+
 	if filter.Overdue {
-		q = q.Where("due_date < ? AND status NOT IN ?", time.Now(), []string{models.DebtStatusSettled})
+		q = q.Where(
+			"due_date < ? AND status NOT IN ?",
+			time.Now().UTC(),
+			[]string{models.DebtStatusSettled},
+		)
 	}
 
 	if filter.Cursor != "" {
@@ -126,7 +139,10 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Debt, 
 	}
 
 	var debts []models.Debt
-	if err := q.Preload("Customer").Order("created_at DESC, id DESC").Limit(filter.Limit + 1).Find(&debts).Error; err != nil {
+	if err := q.Preload("Customer").
+		Order("created_at DESC, id DESC").
+		Limit(filter.Limit + 1).
+		Find(&debts).Error; err != nil {
 		return nil, "", err
 	}
 
@@ -136,6 +152,7 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Debt, 
 		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
 		debts = debts[:filter.Limit]
 	}
+
 	return debts, nextCursor, nil
 }
 
@@ -145,9 +162,11 @@ func (s *Service) RecordPayment(businessID, debtID uuid.UUID, req RecordPaymentR
 	if err := s.db.Where("id = ? AND business_id = ?", debtID, businessID).First(&d).Error; err != nil {
 		return nil, errors.New("debt not found")
 	}
+
 	if d.Status == models.DebtStatusSettled {
 		return nil, errors.New("debt is already settled")
 	}
+
 	if req.Amount > d.AmountDue {
 		return nil, errors.New("payment exceeds outstanding amount")
 	}
@@ -165,7 +184,8 @@ func (s *Service) RecordPayment(businessID, debtID uuid.UUID, req RecordPaymentR
 
 	// Update customer outstanding debt counter for receivables
 	if d.CustomerID != nil && d.Direction == models.DebtDirectionReceivable {
-		s.db.Model(&models.Customer{}).Where("id = ?", *d.CustomerID).
+		s.db.Model(&models.Customer{}).
+			Where("id = ?", *d.CustomerID).
 			UpdateColumn("outstanding_debt", gorm.Expr("outstanding_debt - ?", req.Amount))
 	}
 
@@ -176,6 +196,6 @@ func (s *Service) RecordPayment(businessID, debtID uuid.UUID, req RecordPaymentR
 // Called by a scheduled job daily.
 func (s *Service) MarkOverdue() error {
 	return s.db.Model(&models.Debt{}).
-		Where("due_date < ? AND status NOT IN ?", time.Now(), []string{models.DebtStatusSettled}).
+		Where("due_date < ? AND status NOT IN ?", time.Now().UTC(), []string{models.DebtStatusSettled}).
 		Update("status", models.DebtStatusOverdue).Error
 }

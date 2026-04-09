@@ -1,8 +1,8 @@
-// internal/api/handlers/business/keywords_handler.go
 package business
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -19,6 +19,7 @@ func (h *Handler) GetKeywords(c *gin.Context) {
 		response.InternalError(c, err.Error())
 		return
 	}
+
 	response.OK(c, gin.H{"keywords": keywords})
 }
 
@@ -29,11 +30,13 @@ func (h *Handler) SetKeywords(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
+
 	keywords, err := h.service.SetKeywords(shared.MustBusinessID(c), req)
 	if err != nil {
 		response.Err(c, err)
 		return
 	}
+
 	response.OK(c, gin.H{"keywords": keywords})
 }
 
@@ -51,6 +54,23 @@ func (h *Handler) GetPublicKeywords(c *gin.Context) {
 			response.NotFound(c, "business not found")
 			return
 		}
+		response.InternalError(c, err.Error())
+		return
+	}
+
+	response.OK(c, gin.H{"keywords": keywords})
+}
+
+// GET /public/keywords/suggestions?q=Fa
+func (h *Handler) SuggestPublicKeywords(c *gin.Context) {
+	query := strings.TrimSpace(c.Query("q"))
+	if query == "" {
+		response.OK(c, gin.H{"keywords": []string{}})
+		return
+	}
+
+	keywords, err := h.service.SuggestKeywords(query)
+	if err != nil {
 		response.InternalError(c, err.Error())
 		return
 	}

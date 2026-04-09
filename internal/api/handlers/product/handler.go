@@ -149,3 +149,28 @@ func (h *Handler) UploadImage(c *gin.Context) {
 	}
 	response.OK(c, gin.H{"image_url": result.URL})
 }
+
+// GET /products/scan?barcode=1234567890123
+func (h *Handler) Scan(c *gin.Context) {
+	barcode := c.Query("barcode")
+	if barcode == "" {
+		response.BadRequest(c, "barcode query parameter is required")
+		return
+	}
+	p, err := h.service.GetByBarcode(shared.MustBusinessID(c), barcode)
+	if err != nil {
+		response.NotFound(c, err.Error())
+		return
+	}
+	response.OK(c, p)
+}
+
+// GET /products/inventory?store_id=xxx
+func (h *Handler) Inventory(c *gin.Context) {
+	products, err := h.service.ListForFrontStore(shared.MustBusinessID(c), shared.QueryUUID(c, "store_id"))
+	if err != nil {
+		response.InternalError(c, err.Error())
+		return
+	}
+	response.OK(c, products)
+}
