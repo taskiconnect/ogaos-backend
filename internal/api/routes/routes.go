@@ -17,6 +17,7 @@ import (
 	handlerInvoice "ogaos-backend/internal/api/handlers/invoice"
 	handlerLocation "ogaos-backend/internal/api/handlers/location"
 	handlerProduct "ogaos-backend/internal/api/handlers/product"
+	handlerPublic "ogaos-backend/internal/api/handlers/public"
 	handlerRecruitment "ogaos-backend/internal/api/handlers/recruitment"
 	handlerSale "ogaos-backend/internal/api/handlers/sale"
 	handlerStore "ogaos-backend/internal/api/handlers/store"
@@ -48,6 +49,7 @@ func SetupAuthRoutes(
 	couponHandler *handlerCoupon.Handler,
 	subscriptionHandler *handlerSubscription.Handler,
 	adminAuthHandler *handlerAdminAuth.Handler,
+	publicHandler *handlerPublic.Handler,
 ) {
 	userSecret := []byte(cfg.JWTSecret)
 	adminSecret := []byte(cfg.AdminJWTSecret)
@@ -93,16 +95,31 @@ func SetupAuthRoutes(
 
 	public := v1.Group("/public")
 	{
+		// ── Public business discovery/search ─────────────────────────────────
+		// Example:
+		// GET /api/v1/public/business/search?q=tailor&state=Lagos&lga=Ikeja&radius_km=10
+		public.GET("/business/search", publicHandler.SearchBusinesses)
+
+		// ── Business profile ──────────────────────────────────────────────────
 		public.GET("/business/:slug", businessHandler.GetPublicProfile)
 		public.GET("/business/:slug/keywords", businessHandler.GetPublicKeywords)
 		public.GET("/keywords/suggestions", businessHandler.SuggestPublicKeywords)
+
+		// ── Aggregated storefront page ────────────────────────────────────────
+		public.GET("/business/:slug/full", publicHandler.GetFullBusinessPage)
+
+		// ── Digital storefront ────────────────────────────────────────────────
 		public.GET("/business/:slug/products", digitalHandler.ListPublicProducts)
+		public.GET("/store/:slug", digitalHandler.GetPublicProduct)
+		public.POST("/store/:id/purchase", digitalHandler.Purchase)
+		public.GET("/orders/:order_id/fulfillment", digitalHandler.GetFulfillment)
+		public.GET("/orders/:order_id/download", digitalHandler.GetDownload) // legacy fallback
+		public.GET("/downloads/:token", digitalHandler.DownloadByToken)
+
+		// ── Recruitment ───────────────────────────────────────────────────────
 		public.GET("/jobs/:slug", recruitmentHandler.GetPublicJob)
 		public.POST("/jobs/:id/apply", recruitmentHandler.Apply)
 		public.POST("/assessment/:app_id/submit", recruitmentHandler.SubmitAssessment)
-		public.GET("/store/:slug", digitalHandler.GetPublicProduct)
-		public.POST("/store/:id/purchase", digitalHandler.Purchase)
-		public.GET("/orders/:order_id/download", digitalHandler.GetDownload)
 	}
 
 	protected := v1.Group("")
@@ -241,6 +258,11 @@ func SetupAuthRoutes(
 
 	dp := protected.Group("/digital-products")
 	{
+		// Orders first so they do not conflict with /:id
+		dp.GET("/orders", middleware.RequireRole(middleware.RoleOwner), digitalHandler.ListOrders)
+		dp.GET("/orders/:id", middleware.RequireRole(middleware.RoleOwner), digitalHandler.GetOrder)
+		dp.POST("/orders/:id/resend-access", middleware.RequireRole(middleware.RoleOwner), digitalHandler.ResendAccess)
+
 		dp.POST("", middleware.RequireRole(middleware.RoleOwner), digitalHandler.Create)
 		dp.GET("", middleware.RequireRole(middleware.RoleOwner), digitalHandler.List)
 		dp.GET("/:id", middleware.RequireRole(middleware.RoleOwner), digitalHandler.Get)

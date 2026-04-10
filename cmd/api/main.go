@@ -23,6 +23,7 @@ import (
 	handlerInvoice "ogaos-backend/internal/api/handlers/invoice"
 	handlerLocation "ogaos-backend/internal/api/handlers/location"
 	handlerProduct "ogaos-backend/internal/api/handlers/product"
+	handlerPublic "ogaos-backend/internal/api/handlers/public"
 	handlerRecruitment "ogaos-backend/internal/api/handlers/recruitment"
 	handlerSale "ogaos-backend/internal/api/handlers/sale"
 	handlerStore "ogaos-backend/internal/api/handlers/store"
@@ -48,6 +49,7 @@ import (
 	svcInvoice "ogaos-backend/internal/service/invoice"
 	svcLocation "ogaos-backend/internal/service/location"
 	svcProduct "ogaos-backend/internal/service/product"
+	svcPublic "ogaos-backend/internal/service/public"
 	svcRecruitment "ogaos-backend/internal/service/recruitment"
 	svcSale "ogaos-backend/internal/service/sale"
 	svcStore "ogaos-backend/internal/service/store"
@@ -113,6 +115,7 @@ func main() {
 	businessSvc := svcBusiness.NewService(db.DB)
 	customerSvc := svcCustomer.NewService(db.DB)
 	productSvc := svcProduct.NewService(db.DB)
+	publicSvc := svcPublic.NewService(db.DB)
 
 	receiptSender := svcSale.NewEmailReceiptSender(db.DB)
 	saleSvc := svcSale.NewService(db.DB, receiptSender)
@@ -143,6 +146,7 @@ func main() {
 	businessHandler := handlerBusiness.NewHandler(businessSvc, uploadSvc)
 	customerHandler := handlerCustomer.NewHandler(customerSvc)
 	productHandler := handlerProduct.NewHandler(productSvc, uploadSvc)
+	publicHandler := handlerPublic.NewHandler(publicSvc)
 	saleHandler := handlerSale.NewHandler(saleSvc, logger)
 	invoiceHandler := handlerInvoice.NewHandler(invoiceSvc)
 	expenseHandler := handlerExpense.NewHandler(expenseSvc)
@@ -207,6 +211,7 @@ func main() {
 		couponHandler,
 		subscriptionHandler,
 		adminAuthHandler,
+		publicHandler,
 	)
 
 	srv := &http.Server{
