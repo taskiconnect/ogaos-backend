@@ -1,4 +1,3 @@
-// internal/domain/models/public.go
 package models
 
 import (
@@ -9,8 +8,6 @@ import (
 
 // ─── Business ────────────────────────────────────────────────────────────────
 
-// BusinessPublic is the safe, frontend-facing representation of a Business.
-// Never expose internal fields like ReferralCodeUsed, Status, etc.
 type BusinessPublic struct {
 	ID                 uuid.UUID `json:"id"`
 	Name               string    `json:"name"`
@@ -33,8 +30,6 @@ type BusinessPublic struct {
 
 // ─── Digital Products ────────────────────────────────────────────────────────
 
-// DigitalProductPublic is the public-safe representation of a DigitalProduct.
-// FileURL is intentionally excluded — buyers access files via signed tokens only.
 type DigitalProductPublic struct {
 	ID              uuid.UUID `json:"id"`
 	Title           string    `json:"title"`
@@ -47,8 +42,8 @@ type DigitalProductPublic struct {
 	CoverImageURL   *string   `json:"cover_image_url"`
 	GalleryImages   string    `json:"gallery_image_urls"`
 	PromoVideoURL   *string   `json:"promo_video_url"`
-	FileSize        *int64    `json:"file_size"`      // bytes — useful for UI display
-	FileMimeType    *string   `json:"file_mime_type"` // e.g. "application/pdf"
+	FileSize        *int64    `json:"file_size"`
+	FileMimeType    *string   `json:"file_mime_type"`
 	DeliveryNote    *string   `json:"delivery_note"`
 	SalesCount      int       `json:"sales_count"`
 	CreatedAt       time.Time `json:"created_at"`
@@ -56,16 +51,15 @@ type DigitalProductPublic struct {
 
 // ─── Physical Products & Services ────────────────────────────────────────────
 
-// ProductPublic is the public-safe representation of a physical Product or Service.
 type ProductPublic struct {
 	ID          uuid.UUID `json:"id"`
 	Name        string    `json:"name"`
 	Description *string   `json:"description"`
-	Type        string    `json:"type"` // "product" | "service"
+	Type        string    `json:"type"`
 	Price       int64     `json:"price"`
 	ImageURL    *string   `json:"image_url"`
 	SKU         *string   `json:"sku"`
-	InStock     bool      `json:"in_stock"` // derived: not out of stock OR inventory not tracked
+	InStock     bool      `json:"in_stock"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -99,8 +93,6 @@ type PublicBusinessPage struct {
 
 // ─── LGA Centers ─────────────────────────────────────────────────────────────
 
-// LocalGovernmentCenter stores the approximate center point for an LGA.
-// Search uses this instead of Google suggested addresses.
 type LocalGovernmentCenter struct {
 	ID              uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
 	Country         string    `gorm:"type:text;not null;index:idx_lga_center_lookup,priority:1" json:"country"`
@@ -135,13 +127,11 @@ type PublicBusinessSearchItem struct {
 }
 
 type PublicBusinessSearchMeta struct {
-	Query                     string   `json:"query"`
-	State                     string   `json:"state"`
-	LocalGovernment           string   `json:"local_government"`
-	RadiusKM                  float64  `json:"radius_km"`
-	UsedFallbackRadius        bool     `json:"used_fallback_radius"`
-	SuggestedExpandedRadiusKM *float64 `json:"suggested_expanded_radius_km,omitempty"`
-	Total                     int      `json:"total"`
+	Query               string  `json:"query"`
+	RadiusKM            float64 `json:"radius_km"`
+	UsedCurrentLocation bool    `json:"used_current_location"`
+	LocationDenied      bool    `json:"location_denied"`
+	Total               int     `json:"total"`
 }
 
 type PublicBusinessSearchResponse struct {

@@ -1,4 +1,3 @@
-// internal/service/public/service.go
 package public
 
 import (
@@ -116,18 +115,16 @@ func (s *Service) Invalidate(slug string) {
 	s.cache.invalidate(slug)
 }
 
-// SearchBusinesses searches public businesses around the center of a selected LGA.
-// It supports both keyword search and business-name search.
-// If no result is found within the given radius and radius < 50 km,
-// the response suggests expanding to 50 km.
-func (s *Service) SearchBusinesses(query, state, lga string, radiusKM float64) (*models.PublicBusinessSearchResponse, error) {
+// SearchBusinesses searches public businesses using one of two modes:
+//
+//  1. Coordinate mode:
+//     If lat/lng are provided, return businesses within the given radius.
+//
+//  2. Global keyword mode:
+//     If lat/lng are nil (e.g. location denied), return all public businesses
+//     that match the keyword query, without radius filtering.
+func (s *Service) SearchBusinesses(query string, lat, lng *float64, radiusKM float64) (*models.PublicBusinessSearchResponse, error) {
 	query = strings.TrimSpace(query)
-	state = strings.TrimSpace(state)
-	lga = strings.TrimSpace(lga)
-
-	if state == "" || lga == "" {
-		return nil, errors.New("state and lga are required")
-	}
 
 	if radiusKM <= 0 {
 		radiusKM = defaultSearchRadiusKM
@@ -136,28 +133,49 @@ func (s *Service) SearchBusinesses(query, state, lga string, radiusKM float64) (
 		return nil, fmt.Errorf("invalid radius: maximum allowed radius is %.0f km", maxSearchRadiusKM)
 	}
 
-	center, err := s.fetchLGACenter(state, lga)
-	if err != nil {
-		return nil, err
+	usingLocation := lat != nil && lng != nil
+	if (lat == nil) != (lng == nil) {
+		return nil, errors.New("both latitude and longitude are required together")
 	}
 
-	results, err := s.runBusinessSearch(center, query, radiusKM)
+	if usingLocation {
+		if *lat < -90 || *lat > 90 {
+			return nil, errors.New("invalid latitude: must be between -90 and 90")
+		}
+		if *lng < -180 || *lng > 180 {
+			return nil, errors.New("invalid longitude: must be between -180 and 180")
+		}
+
+		results, err := s.runBusinessSearchByCoordinates(*lat, *lng, query, radiusKM)
+		if err != nil {
+			return nil, err
+		}
+
+		meta := models.PublicBusinessSearchMeta{
+			Query:               query,
+			RadiusKM:            radiusKM,
+			UsedCurrentLocation: true,
+			LocationDenied:      false,
+			Total:               len(results),
+		}
+
+		return &models.PublicBusinessSearchResponse{
+			Meta:    meta,
+			Results: results,
+		}, nil
+	}
+
+	results, err := s.runBusinessSearchGlobal(query)
 	if err != nil {
 		return nil, err
 	}
 
 	meta := models.PublicBusinessSearchMeta{
-		Query:              query,
-		State:              center.State,
-		LocalGovernment:    center.LocalGovernment,
-		RadiusKM:           radiusKM,
-		UsedFallbackRadius: almostEqual(radiusKM, maxSearchRadiusKM),
-		Total:              len(results),
-	}
-
-	if len(results) == 0 && radiusKM < maxSearchRadiusKM {
-		suggested := maxSearchRadiusKM
-		meta.SuggestedExpandedRadiusKM = &suggested
+		Query:               query,
+		RadiusKM:            0,
+		UsedCurrentLocation: false,
+		LocationDenied:      true,
+		Total:               len(results),
 	}
 
 	return &models.PublicBusinessSearchResponse{
@@ -368,34 +386,7 @@ func (s *Service) fetchPhysicalItems(businessID uuid.UUID) (products []models.Pr
 
 // ─── Search Queries ───────────────────────────────────────────────────────────
 
-type lgaCenterRow struct {
-	Country         string
-	State           string
-	LocalGovernment string
-	Latitude        float64
-	Longitude       float64
-}
-
-func (s *Service) fetchLGACenter(state, lga string) (*lgaCenterRow, error) {
-	var row lgaCenterRow
-
-	err := s.db.
-		Table("local_government_centers").
-		Select("country, state, local_government, latitude, longitude").
-		Where("LOWER(TRIM(state)) = LOWER(TRIM(?)) AND LOWER(TRIM(local_government)) = LOWER(TRIM(?))", state, lga).
-		First(&row).Error
-
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, errors.New("location center not found for the selected state and lga")
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	return &row, nil
-}
-
-func (s *Service) runBusinessSearch(center *lgaCenterRow, query string, radiusKM float64) ([]models.PublicBusinessSearchItem, error) {
+func (s *Service) runBusinessSearchByCoordinates(lat, lng float64, query string, radiusKM float64) ([]models.PublicBusinessSearchItem, error) {
 	type searchRow struct {
 		ID              uuid.UUID
 		Name            string
@@ -415,16 +406,7 @@ func (s *Service) runBusinessSearch(center *lgaCenterRow, query string, radiusKM
 	likeQuery := "%" + strings.TrimSpace(query) + "%"
 
 	sql := `
-WITH target_center AS (
-	SELECT
-		latitude AS target_lat,
-		longitude AS target_lng
-	FROM local_government_centers
-	WHERE LOWER(TRIM(state)) = LOWER(TRIM(?))
-	  AND LOWER(TRIM(local_government)) = LOWER(TRIM(?))
-	LIMIT 1
-),
-business_centers AS (
+WITH business_centers AS (
 	SELECT
 		b.id,
 		b.name,
@@ -441,8 +423,10 @@ business_centers AS (
 		lgc.longitude AS business_lng
 	FROM businesses b
 	JOIN local_government_centers lgc
-	  ON LOWER(TRIM(lgc.state)) = LOWER(TRIM(b.state))
-	 AND LOWER(TRIM(lgc.local_government)) = LOWER(TRIM(b.local_government))
+	  ON LOWER(REGEXP_REPLACE(TRIM(lgc.state), '[^a-z0-9]+', '', 'g')) =
+	     LOWER(REGEXP_REPLACE(TRIM(b.state), '[^a-z0-9]+', '', 'g'))
+	 AND LOWER(REGEXP_REPLACE(TRIM(lgc.local_government), '[^a-z0-9]+', '', 'g')) =
+	     LOWER(REGEXP_REPLACE(TRIM(b.local_government), '[^a-z0-9]+', '', 'g'))
 	WHERE b.is_profile_public = true
 ),
 ranked AS (
@@ -454,15 +438,14 @@ ranked AS (
 					1.0,
 					GREATEST(
 						-1.0,
-						COS(RADIANS(tc.target_lat)) * COS(RADIANS(bc.business_lat)) *
-						COS(RADIANS(bc.business_lng) - RADIANS(tc.target_lng)) +
-						SIN(RADIANS(tc.target_lat)) * SIN(RADIANS(bc.business_lat))
+						COS(RADIANS(?)) * COS(RADIANS(bc.business_lat)) *
+						COS(RADIANS(bc.business_lng) - RADIANS(?)) +
+						SIN(RADIANS(?)) * SIN(RADIANS(bc.business_lat))
 					)
 				)
 			)
 		) AS distance_km
 	FROM business_centers bc
-	CROSS JOIN target_center tc
 )
 SELECT
 	r.id,
@@ -509,8 +492,9 @@ LIMIT ?
 	var rows []searchRow
 	err := s.db.Raw(
 		sql,
-		center.State,
-		center.LocalGovernment,
+		lat,
+		lng,
+		lat,
 		radiusKM,
 		query,
 		likeQuery,
@@ -538,6 +522,104 @@ LIMIT ?
 			Country:         r.Country,
 			IsVerified:      r.IsVerified,
 			DistanceKM:      round2(r.DistanceKM),
+			Keywords:        splitKeywords(r.KeywordsCSV),
+		})
+	}
+
+	if results == nil {
+		results = []models.PublicBusinessSearchItem{}
+	}
+
+	return results, nil
+}
+
+func (s *Service) runBusinessSearchGlobal(query string) ([]models.PublicBusinessSearchItem, error) {
+	type searchRow struct {
+		ID              uuid.UUID
+		Name            string
+		Slug            string
+		Category        string
+		Description     *string
+		LogoURL         *string
+		CityTown        string
+		LocalGovernment string
+		State           string
+		Country         string
+		IsVerified      bool
+		KeywordsCSV     *string
+	}
+
+	likeQuery := "%" + strings.TrimSpace(query) + "%"
+
+	sql := `
+SELECT
+	b.id,
+	b.name,
+	b.slug,
+	b.category,
+	b.description,
+	b.logo_url,
+	b.city_town,
+	b.local_government,
+	b.state,
+	b.country,
+	b.is_verified,
+	NULLIF(STRING_AGG(DISTINCT k.name, '||'), '') AS keywords_csv
+FROM businesses b
+LEFT JOIN business_keywords bk ON bk.business_id = b.id
+LEFT JOIN keywords k ON k.id = bk.keyword_id
+WHERE b.is_profile_public = true
+  AND (
+	? = '' OR
+	b.name ILIKE ? OR
+	b.category ILIKE ? OR
+	COALESCE(b.description, '') ILIKE ? OR
+	EXISTS (
+		SELECT 1
+		FROM business_keywords bk2
+		JOIN keywords k2 ON k2.id = bk2.keyword_id
+		WHERE bk2.business_id = b.id
+		  AND k2.name ILIKE ?
+	)
+  )
+GROUP BY
+	b.id, b.name, b.slug, b.category, b.description, b.logo_url,
+	b.city_town, b.local_government, b.state, b.country, b.is_verified
+ORDER BY
+	b.is_verified DESC,
+	b.name ASC
+LIMIT ?
+`
+
+	var rows []searchRow
+	err := s.db.Raw(
+		sql,
+		query,
+		likeQuery,
+		likeQuery,
+		likeQuery,
+		likeQuery,
+		defaultSearchLimit,
+	).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]models.PublicBusinessSearchItem, 0, len(rows))
+	for _, r := range rows {
+		results = append(results, models.PublicBusinessSearchItem{
+			ID:              r.ID,
+			Name:            r.Name,
+			Slug:            r.Slug,
+			Category:        r.Category,
+			Description:     r.Description,
+			LogoURL:         r.LogoURL,
+			CityTown:        r.CityTown,
+			LocalGovernment: r.LocalGovernment,
+			State:           r.State,
+			Country:         r.Country,
+			IsVerified:      r.IsVerified,
+			DistanceKM:      0,
 			Keywords:        splitKeywords(r.KeywordsCSV),
 		})
 	}
@@ -606,9 +688,4 @@ func splitKeywords(csv *string) []string {
 
 func round2(v float64) float64 {
 	return math.Round(v*100) / 100
-}
-
-func almostEqual(a, b float64) bool {
-	const epsilon = 0.000001
-	return math.Abs(a-b) < epsilon
 }

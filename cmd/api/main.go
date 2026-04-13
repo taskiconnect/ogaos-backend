@@ -111,7 +111,7 @@ func main() {
 		cfg.FrontendURL,
 	)
 
-	locService := svcLocation.NewService()
+	locService := svcLocation.NewService(db.DB)
 	businessSvc := svcBusiness.NewService(db.DB)
 	customerSvc := svcCustomer.NewService(db.DB)
 	productSvc := svcProduct.NewService(db.DB)
