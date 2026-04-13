@@ -24,24 +24,37 @@ func BusinessScope(db *gorm.DB) gin.HandlerFunc {
 
 		ctxBID, exists := c.Get(ContextKeyBusinessID)
 		if !exists {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"success": false, "message": "authentication required"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"message": "authentication required",
+			})
 			return
 		}
 
 		jwtBID, ok := ctxBID.(uuid.UUID)
 		if !ok {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"success": false, "message": "invalid business_id claim"})
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+				"success": false,
+				"message": "invalid business_id claim",
+			})
 			return
 		}
 
 		if paramID := c.Param("business_id"); paramID != "" {
 			paramBID, err := uuid.Parse(paramID)
 			if err != nil {
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid business_id parameter"})
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+					"success": false,
+					"message": "invalid business_id parameter",
+				})
 				return
 			}
+
 			if paramBID != jwtBID {
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "message": "access denied: resource belongs to a different business"})
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"success": false,
+					"message": "access denied: resource belongs to a different business",
+				})
 				return
 			}
 		}
@@ -62,7 +75,10 @@ func SubscriptionGuard(db *gorm.DB, feature string) gin.HandlerFunc {
 
 		businessID, exists := c.Get(ContextKeyBusinessID)
 		if !exists {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"success": false, "message": "authentication required"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"message": "authentication required",
+			})
 			return
 		}
 
@@ -126,7 +142,10 @@ func LimitGuard(db *gorm.DB, resource string) gin.HandlerFunc {
 
 		businessID, exists := c.Get(ContextKeyBusinessID)
 		if !exists {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"success": false, "message": "authentication required"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"message": "authentication required",
+			})
 			return
 		}
 
@@ -238,6 +257,7 @@ func LimitGuard(db *gorm.DB, resource string) gin.HandlerFunc {
 			return
 		}
 
+		// -1 means unlimited
 		if maxAllowed == -1 {
 			c.Next()
 			return
@@ -285,6 +305,7 @@ func planHasFeature(plan, feature string) bool {
 		"growth": {
 			"digital_store",
 			"sales",
+			"products",
 			"ledger",
 			"invoices",
 			"debt_tracking",
@@ -294,6 +315,7 @@ func planHasFeature(plan, feature string) bool {
 		"pro": {
 			"digital_store",
 			"sales",
+			"products",
 			"ledger",
 			"invoices",
 			"debt_tracking",
@@ -317,7 +339,7 @@ func planHasFeature(plan, feature string) bool {
 	}
 
 	for _, f := range features[plan] {
-		if f == feature {
+		if f == "*" || f == feature {
 			return true
 		}
 	}
