@@ -1,8 +1,9 @@
-// internal/api/handlers/recruitment/handler.go
 package recruitment
 
 import (
 	"io"
+	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -50,6 +51,33 @@ func (h *Handler) ListJobs(c *gin.Context) {
 		return
 	}
 	response.CursorList(c, jobs, nextCursor)
+}
+
+// GET /public/jobs
+func (h *Handler) ListPublicJobs(c *gin.Context) {
+	limit := 20
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			limit = parsed
+		}
+	}
+
+	isRemotePtr := parseBoolPointer(c.Query("is_remote"))
+
+	items, nextCursor, err := h.service.ListPublicJobs(svcRecruitment.PublicJobListFilter{
+		Query:    strings.TrimSpace(c.Query("q")),
+		Type:     strings.TrimSpace(c.Query("type")),
+		Location: strings.TrimSpace(c.Query("location")),
+		IsRemote: isRemotePtr,
+		Cursor:   strings.TrimSpace(c.Query("cursor")),
+		Limit:    limit,
+	})
+	if err != nil {
+		response.InternalError(c, err.Error())
+		return
+	}
+
+	response.CursorList(c, items, nextCursor)
 }
 
 // GET /jobs/:id
@@ -182,4 +210,22 @@ func (h *Handler) SubmitAssessment(c *gin.Context) {
 		return
 	}
 	response.Message(c, "assessment submitted")
+}
+
+func parseBoolPointer(raw string) *bool {
+	v := strings.TrimSpace(strings.ToLower(raw))
+	if v == "" {
+		return nil
+	}
+
+	switch v {
+	case "true", "1", "yes":
+		b := true
+		return &b
+	case "false", "0", "no":
+		b := false
+		return &b
+	default:
+		return nil
+	}
 }

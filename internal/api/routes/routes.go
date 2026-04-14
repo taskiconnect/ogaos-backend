@@ -117,6 +117,7 @@ func SetupAuthRoutes(
 		public.GET("/downloads/:token", digitalHandler.DownloadByToken)
 
 		// ── Recruitment ───────────────────────────────────────────────────────
+		public.GET("/jobs", recruitmentHandler.ListPublicJobs)
 		public.GET("/jobs/:slug", recruitmentHandler.GetPublicJob)
 		public.POST("/jobs/:id/apply", recruitmentHandler.Apply)
 		public.POST("/assessment/:app_id/submit", recruitmentHandler.SubmitAssessment)
