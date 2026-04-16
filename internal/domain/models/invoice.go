@@ -17,13 +17,17 @@ const (
 )
 
 type Invoice struct {
-	ID                    uuid.UUID  `gorm:"type:uuid;primaryKey;default:uuid_generate_v4()" json:"id"`
-	BusinessID            uuid.UUID  `gorm:"type:uuid;not null;index" json:"business_id"`
-	StoreID               *uuid.UUID `gorm:"type:uuid;index" json:"store_id"`
-	CustomerID            *uuid.UUID `gorm:"type:uuid;index" json:"customer_id"`
-	CreatedBy             uuid.UUID  `gorm:"type:uuid;not null" json:"created_by"`
-	InvoiceNumber         string     `gorm:"size:50;uniqueIndex;not null" json:"invoice_number"`
-	PublicToken           string     `gorm:"size:64;uniqueIndex;not null" json:"public_token"`
+	ID uuid.UUID `gorm:"type:uuid;primaryKey;default:uuid_generate_v4()" json:"id"`
+
+	// invoice_number must be unique PER BUSINESS, not globally
+	BusinessID uuid.UUID  `gorm:"type:uuid;not null;index;uniqueIndex:idx_invoices_business_invoice_number" json:"business_id"`
+	StoreID    *uuid.UUID `gorm:"type:uuid;index" json:"store_id"`
+	CustomerID *uuid.UUID `gorm:"type:uuid;index" json:"customer_id"`
+	CreatedBy  uuid.UUID  `gorm:"type:uuid;not null" json:"created_by"`
+
+	InvoiceNumber string `gorm:"size:50;not null;uniqueIndex:idx_invoices_business_invoice_number" json:"invoice_number"`
+	PublicToken   string `gorm:"size:64;uniqueIndex;not null" json:"public_token"`
+
 	RevisionNumber        int        `gorm:"not null;default:1" json:"revision_number"`
 	RevisedFromInvoiceID  *uuid.UUID `gorm:"type:uuid;index" json:"revised_from_invoice_id"`
 	SupersededByInvoiceID *uuid.UUID `gorm:"type:uuid;index" json:"superseded_by_invoice_id"`
@@ -60,7 +64,12 @@ func (inv *Invoice) CalculateVAT() {
 		inv.VATAmount = 0
 		return
 	}
+
 	net := inv.SubTotal - inv.DiscountAmount
+	if net < 0 {
+		net = 0
+	}
+
 	if inv.VATInclusive {
 		base := float64(net) / (1 + inv.VATRate/100)
 		inv.VATAmount = int64(float64(net) - base)
@@ -74,7 +83,12 @@ func (inv *Invoice) CalculateWHT() {
 		inv.WHTAmount = 0
 		return
 	}
+
 	net := inv.SubTotal - inv.DiscountAmount
+	if net < 0 {
+		net = 0
+	}
+
 	inv.WHTAmount = int64(float64(net) * inv.WHTRate / 100)
 }
 
@@ -83,13 +97,24 @@ func (inv *Invoice) CalculateTotal() {
 	inv.CalculateWHT()
 
 	net := inv.SubTotal - inv.DiscountAmount
+	if net < 0 {
+		net = 0
+	}
+
 	if !inv.VATInclusive {
 		net += inv.VATAmount
 	}
 	net -= inv.WHTAmount
 
+	if net < 0 {
+		net = 0
+	}
+
 	inv.TotalAmount = net
 	inv.BalanceDue = inv.TotalAmount - inv.AmountPaid
+	if inv.BalanceDue < 0 {
+		inv.BalanceDue = 0
+	}
 }
 
 func (inv *Invoice) UpdateStatus() {

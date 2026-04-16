@@ -33,13 +33,16 @@ type DateOnly struct{ time.Time }
 
 func (d *DateOnly) UnmarshalJSON(b []byte) error {
 	s := strings.Trim(string(b), `"`)
+
 	if s == "null" || s == "" {
 		return nil
 	}
+
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
 		d.Time = t
 		return nil
 	}
+
 	t, err := time.Parse("2006-01-02", s)
 	if err != nil {
 		return fmt.Errorf("date must be YYYY-MM-DD or RFC-3339, got %q", s)
@@ -99,11 +102,6 @@ var ErrNotFound = errors.New("invoice not found")
 var ErrInvoiceLocked = errors.New("invoice can no longer be edited directly; create a revision instead")
 
 func (s *Service) Create(businessID, createdBy uuid.UUID, req CreateRequest) (*models.Invoice, error) {
-	invoiceNumber, err := s.nextInvoiceNumber(businessID)
-	if err != nil {
-		return nil, err
-	}
-
 	token, err := generatePublicToken()
 	if err != nil {
 		return nil, err
@@ -121,7 +119,6 @@ func (s *Service) Create(businessID, createdBy uuid.UUID, req CreateRequest) (*m
 		StoreID:        req.StoreID,
 		CustomerID:     req.CustomerID,
 		CreatedBy:      createdBy,
-		InvoiceNumber:  invoiceNumber,
 		PublicToken:    token,
 		RevisionNumber: 1,
 		IssueDate:      issueDate,
@@ -138,12 +135,20 @@ func (s *Service) Create(businessID, createdBy uuid.UUID, req CreateRequest) (*m
 	inv.CalculateTotal()
 
 	err = s.db.Transaction(func(tx *gorm.DB) error {
+		invoiceNumber, err := s.nextInvoiceNumberTx(tx, businessID, issueDate)
+		if err != nil {
+			return err
+		}
+		inv.InvoiceNumber = invoiceNumber
+
 		if err := tx.Create(&inv).Error; err != nil {
 			return err
 		}
+
 		for i := range items {
 			items[i].InvoiceID = inv.ID
 		}
+
 		return tx.Create(&items).Error
 	})
 	if err != nil {
@@ -220,9 +225,11 @@ func (s *Service) Update(businessID, invoiceID uuid.UUID, req UpdateRequest) (*m
 		if err := tx.Where("invoice_id = ?", inv.ID).Delete(&models.InvoiceItem{}).Error; err != nil {
 			return err
 		}
+
 		for i := range items {
 			items[i].InvoiceID = inv.ID
 		}
+
 		return tx.Create(&items).Error
 	})
 	if err != nil {
@@ -253,11 +260,6 @@ func (s *Service) Revise(businessID, createdBy, invoiceID uuid.UUID) (*models.In
 		return nil, errors.New("invoice has already been revised")
 	}
 
-	newNumber, err := s.nextInvoiceNumber(businessID)
-	if err != nil {
-		return nil, err
-	}
-
 	token, err := generatePublicToken()
 	if err != nil {
 		return nil, err
@@ -268,7 +270,6 @@ func (s *Service) Revise(businessID, createdBy, invoiceID uuid.UUID) (*models.In
 		StoreID:              original.StoreID,
 		CustomerID:           original.CustomerID,
 		CreatedBy:            createdBy,
-		InvoiceNumber:        newNumber,
 		PublicToken:          token,
 		RevisionNumber:       original.RevisionNumber + 1,
 		RevisedFromInvoiceID: &original.ID,
@@ -305,15 +306,24 @@ func (s *Service) Revise(businessID, createdBy, invoiceID uuid.UUID) (*models.In
 	}
 
 	err = s.db.Transaction(func(tx *gorm.DB) error {
+		newNumber, err := s.nextInvoiceNumberTx(tx, businessID, newInv.IssueDate)
+		if err != nil {
+			return err
+		}
+		newInv.InvoiceNumber = newNumber
+
 		if err := tx.Create(&newInv).Error; err != nil {
 			return err
 		}
+
 		for i := range items {
 			items[i].InvoiceID = newInv.ID
 		}
+
 		if err := tx.Create(&items).Error; err != nil {
 			return err
 		}
+
 		return tx.Model(&models.Invoice{}).
 			Where("id = ? AND business_id = ?", original.ID, businessID).
 			Updates(map[string]interface{}{
@@ -507,6 +517,7 @@ func (s *Service) RecordPayment(businessID, invoiceID uuid.UUID, amountPaid int6
 	if err := s.db.Where("id = ? AND business_id = ?", invoiceID, businessID).First(&inv).Error; err != nil {
 		return nil, ErrNotFound
 	}
+
 	if inv.Status == models.InvoiceStatusCancelled || inv.Status == models.InvoiceStatusSuperseded {
 		return nil, errors.New("cannot record payment on this invoice")
 	}
@@ -561,20 +572,22 @@ func (s *Service) MarkOverdue() error {
 		Update("status", models.InvoiceStatusOverdue).Error
 }
 
-func (s *Service) nextInvoiceNumber(businessID uuid.UUID) (string, error) {
-	prefix := fmt.Sprintf("INV-%s-", time.Now().Format("200601"))
-	var last models.Invoice
-	err := s.db.
-		Where("business_id = ? AND invoice_number LIKE ?", businessID, prefix+"%").
-		Order("invoice_number DESC").
-		First(&last).Error
+func (s *Service) nextInvoiceNumberTx(tx *gorm.DB, businessID uuid.UUID, issueDate time.Time) (string, error) {
+	period := issueDate.Format("200601")
 
-	seq := 1
-	if err == nil {
-		fmt.Sscanf(last.InvoiceNumber[len(prefix):], "%d", &seq)
-		seq++
+	var seq models.BusinessInvoiceSequence
+	err := tx.Raw(`
+		INSERT INTO business_invoice_sequences (business_id, period, last_invoice_number)
+		VALUES (?, ?, 1)
+		ON CONFLICT (business_id, period)
+		DO UPDATE SET last_invoice_number = business_invoice_sequences.last_invoice_number + 1
+		RETURNING business_id, period, last_invoice_number
+	`, businessID, period).Scan(&seq).Error
+	if err != nil {
+		return "", fmt.Errorf("could not generate invoice number: %w", err)
 	}
-	return fmt.Sprintf("%s%04d", prefix, seq), nil
+
+	return fmt.Sprintf("INV-%s-%04d", period, seq.LastInvoiceNumber), nil
 }
 
 func buildInvoiceItems(inputs []InvoiceItemInput) ([]models.InvoiceItem, int64) {
@@ -583,6 +596,10 @@ func buildInvoiceItems(inputs []InvoiceItemInput) ([]models.InvoiceItem, int64) 
 
 	for _, item := range inputs {
 		lineTotal := (item.UnitPrice * int64(item.Quantity)) - item.Discount
+		if lineTotal < 0 {
+			lineTotal = 0
+		}
+
 		items = append(items, models.InvoiceItem{
 			ProductID:    item.ProductID,
 			Description:  item.Description,
