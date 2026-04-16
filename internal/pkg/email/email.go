@@ -1,25 +1,39 @@
-// internal/pkg/email/email.go
 package email
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 )
 
 const resendAPI = "https://api.resend.com/emails"
 
-type resendPayload struct {
-	From    string   `json:"from"`
-	To      []string `json:"to"`
-	Subject string   `json:"subject"`
-	HTML    string   `json:"html"`
+type resendAttachment struct {
+	Filename    string `json:"filename"`
+	Content     string `json:"content,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
 }
 
-func send(to, subject, html string) error {
+type resendPayload struct {
+	From        string             `json:"from"`
+	To          []string           `json:"to"`
+	Subject     string             `json:"subject"`
+	HTML        string             `json:"html"`
+	Attachments []resendAttachment `json:"attachments,omitempty"`
+}
+
+type Attachment struct {
+	Filename    string
+	Content     []byte
+	ContentType string
+}
+
+func send(to, subject, html string, attachments ...Attachment) error {
 	apiKey := os.Getenv("RESEND_API_KEY")
 	if apiKey == "" {
 		log.Println("[EMAIL] RESEND_API_KEY is not set — email not sent")
@@ -36,6 +50,25 @@ func send(to, subject, html string) error {
 		To:      []string{to},
 		Subject: subject,
 		HTML:    html,
+	}
+
+	if len(attachments) > 0 {
+		payload.Attachments = make([]resendAttachment, 0, len(attachments))
+		for _, a := range attachments {
+			if len(a.Content) == 0 {
+				continue
+			}
+			contentType := a.ContentType
+			if strings.TrimSpace(contentType) == "" {
+				contentType = "application/octet-stream"
+			}
+
+			payload.Attachments = append(payload.Attachments, resendAttachment{
+				Filename:    a.Filename,
+				Content:     base64.StdEncoding.EncodeToString(a.Content),
+				ContentType: contentType,
+			})
+		}
 	}
 
 	body, err := json.Marshal(payload)
@@ -69,7 +102,7 @@ func send(to, subject, html string) error {
 
 // SendVerificationEmail sends an account verification email to a new business owner.
 func SendVerificationEmail(to, token, frontendURL, businessName string) {
-	link := fmt.Sprintf("%s/auth/verify-email?token=%s", frontendURL, token)
+	link := fmt.Sprintf("%s/auth/verify-email?token=%s", strings.TrimRight(frontendURL, "/"), token)
 	html := fmt.Sprintf(`
 		<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
 			<h2>Welcome to OgaOs, %s!</h2>
@@ -83,6 +116,7 @@ func SendVerificationEmail(to, token, frontendURL, businessName string) {
 			<p>If you did not create an account, please ignore this email.</p>
 		</div>
 	`, businessName, link, link)
+
 	if err := send(to, "Verify your OgaOs account", html); err != nil {
 		log.Printf("[EMAIL ERROR] SendVerificationEmail to %s: %v", to, err)
 	}
@@ -90,7 +124,7 @@ func SendVerificationEmail(to, token, frontendURL, businessName string) {
 
 // SendStaffInvitationEmail sends an invitation email to a new staff member.
 func SendStaffInvitationEmail(to, token, frontendURL, businessName string) {
-	link := fmt.Sprintf("%s/auth/verify-email?token=%s", frontendURL, token)
+	link := fmt.Sprintf("%s/auth/verify-email?token=%s", strings.TrimRight(frontendURL, "/"), token)
 	html := fmt.Sprintf(`
 		<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
 			<h2>You've been invited to join %s on OgaOs</h2>
@@ -104,6 +138,7 @@ func SendStaffInvitationEmail(to, token, frontendURL, businessName string) {
 			<p>Your password was set by your employer — ask them for it to log in.</p>
 		</div>
 	`, businessName, link, link)
+
 	if err := send(to, fmt.Sprintf("You're invited to join %s on OgaOs", businessName), html); err != nil {
 		log.Printf("[EMAIL ERROR] SendStaffInvitationEmail to %s: %v", to, err)
 	}
@@ -131,15 +166,16 @@ func SendAssessmentLink(to, applicantName, jobTitle, businessName, assessmentURL
 			<p>Good luck!</p>
 		</div>
 	`, jobTitle, applicantName, jobTitle, businessName, timeLimitMinutes, assessmentURL)
+
 	if err := send(to, subject, html); err != nil {
 		log.Printf("[EMAIL ERROR] SendAssessmentLink to %s: %v", to, err)
 	}
 }
 
 // SendAssessmentResult notifies an applicant of their pass/fail outcome.
-// Score is not disclosed — only the pass/fail decision.
 func SendAssessmentResult(to, applicantName, jobTitle, businessName string, passed bool) {
 	var subject, heading, detail string
+
 	if passed {
 		subject = fmt.Sprintf("Assessment passed — %s at %s", jobTitle, businessName)
 		heading = "Congratulations — you passed!"
@@ -149,6 +185,7 @@ func SendAssessmentResult(to, applicantName, jobTitle, businessName string, pass
 		heading = "Thank you for completing the assessment."
 		detail = "Unfortunately, you did not meet the pass threshold for this assessment. We encourage you to keep developing your skills and apply for future openings."
 	}
+
 	html := fmt.Sprintf(`
 		<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
 			<h2>%s</h2>
@@ -156,6 +193,7 @@ func SendAssessmentResult(to, applicantName, jobTitle, businessName string, pass
 			<p>%s</p>
 		</div>
 	`, heading, applicantName, detail)
+
 	if err := send(to, subject, html); err != nil {
 		log.Printf("[EMAIL ERROR] SendAssessmentResult to %s: %v", to, err)
 	}
@@ -177,6 +215,7 @@ func SendDigitalProductAccess(to, buyerName, productTitle, businessName, downloa
 			<p>This link is personal to you — please do not share it.</p>
 		</div>
 	`, buyerName, productTitle, businessName, downloadURL)
+
 	if err := send(to, subject, html); err != nil {
 		log.Printf("[EMAIL ERROR] SendDigitalProductAccess to %s: %v", to, err)
 	}
@@ -192,6 +231,7 @@ func SendPayoutNotification(to, ownerName, productTitle string, amountKobo int64
 			<p>It should arrive within 1 business day. Contact support if you have any issues.</p>
 		</div>
 	`, ownerName, formatKobo(amountKobo), productTitle)
+
 	if err := send(to, "Payout sent — OgaOs", html); err != nil {
 		log.Printf("[EMAIL ERROR] SendPayoutNotification to %s: %v", to, err)
 	}
@@ -208,6 +248,7 @@ func SendPayoutFailed(to, ownerName, productTitle string, amountKobo int64, reas
 			<p>Please log in to your OgaOs dashboard to check or update your bank account details.</p>
 		</div>
 	`, ownerName, formatKobo(amountKobo), productTitle, reason)
+
 	if err := send(to, "Payout failed — action required", html); err != nil {
 		log.Printf("[EMAIL ERROR] SendPayoutFailed to %s: %v", to, err)
 	}
@@ -215,21 +256,52 @@ func SendPayoutFailed(to, ownerName, productTitle string, amountKobo int64, reas
 
 // ─── Invoices & Receipts ─────────────────────────────────────────────────────
 
-// SendInvoice emails an invoice view link to a customer.
-func SendInvoice(to, customerName, businessName, invoiceNumber, viewURL string) {
+// SendInvoice emails an invoice view link to a customer and optionally attaches the PDF.
+func SendInvoice(
+	to string,
+	customerName string,
+	businessName string,
+	invoiceNumber string,
+	viewURL string,
+	pdf []byte,
+	pdfFilename string,
+) {
 	subject := fmt.Sprintf("Invoice %s from %s", invoiceNumber, businessName)
+
 	html := fmt.Sprintf(`
-		<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-			<h2>Invoice from %s</h2>
+		<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #111827;">
+			<h2 style="margin-bottom: 12px;">Invoice from %s</h2>
 			<p>Hi %s,</p>
-			<p>Please find your invoice <strong>%s</strong> at the link below.</p>
-			<p>
+			<p>Please find your invoice <strong>%s</strong> below.</p>
+			<p style="margin: 24px 0;">
 				<a href="%s" style="background-color:#4F46E5;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;display:inline-block;">View Invoice</a>
 			</p>
-			<p>Or copy this link: %s</p>
+			<p>A PDF copy of this invoice is also attached to this email for your records.</p>
+
+			<div style="display:none;visibility:hidden;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">
+				<p>Or copy this link into your browser:</p>
+				<p style="word-break: break-word;">%s</p>
+			</div>
+
+			<hr style="margin: 24px 0; border: 0; border-top: 1px solid #E5E7EB;">
+			<p style="margin:0; font-size:12px; color:#6B7280;">Powered by <strong style="color:#111827;">OgaOs</strong></p>
 		</div>
 	`, businessName, customerName, invoiceNumber, viewURL, viewURL)
-	if err := send(to, subject, html); err != nil {
+
+	var attachments []Attachment
+	if len(pdf) > 0 {
+		filename := strings.TrimSpace(pdfFilename)
+		if filename == "" {
+			filename = strings.ReplaceAll(invoiceNumber, " ", "-") + ".pdf"
+		}
+		attachments = append(attachments, Attachment{
+			Filename:    filename,
+			Content:     pdf,
+			ContentType: "application/pdf",
+		})
+	}
+
+	if err := send(to, subject, html, attachments...); err != nil {
 		log.Printf("[EMAIL ERROR] SendInvoice to %s: %v", to, err)
 	}
 }
@@ -248,6 +320,7 @@ func SendReceipt(to, customerName, businessName, receiptNumber, viewURL string) 
 			<p>Or copy this link: %s</p>
 		</div>
 	`, businessName, customerName, receiptNumber, viewURL, viewURL)
+
 	if err := send(to, subject, html); err != nil {
 		log.Printf("[EMAIL ERROR] SendReceipt to %s: %v", to, err)
 	}
@@ -265,6 +338,7 @@ func SendSubscriptionExpiring(to, ownerName, plan, renewalDate string) {
 			<p>To manage your subscription, visit your OgaOs dashboard.</p>
 		</div>
 	`, ownerName, plan, renewalDate)
+
 	if err := send(to, "Your OgaOs subscription renews in 3 days", html); err != nil {
 		log.Printf("[EMAIL ERROR] SendSubscriptionExpiring to %s: %v", to, err)
 	}
@@ -282,12 +356,13 @@ func SendSubscriptionExpired(to, ownerName, plan string) {
 			</p>
 		</div>
 	`, ownerName, plan)
+
 	if err := send(to, "Your OgaOs subscription has expired", html); err != nil {
 		log.Printf("[EMAIL ERROR] SendSubscriptionExpired to %s: %v", to, err)
 	}
 }
 
-// SendAdminOTPEmail sends the OTP code to admin's email
+// SendAdminOTPEmail sends the OTP code to admin's email.
 func SendAdminOTPEmail(to, firstName, otp string) {
 	subject := "Your OgaOs Admin Login Code"
 	html := fmt.Sprintf(`
@@ -310,9 +385,9 @@ func SendAdminOTPEmail(to, firstName, otp string) {
 	}
 }
 
-// SendAdminPasswordSetupEmail sends password setup link to new admin
+// SendAdminPasswordSetupEmail sends password setup link to new admin.
 func SendAdminPasswordSetupEmail(to, firstName, token, frontendURL string) {
-	link := fmt.Sprintf("%s/admin/setup-password?token=%s", frontendURL, token)
+	link := fmt.Sprintf("%s/admin/setup-password?token=%s", strings.TrimRight(frontendURL, "/"), token)
 	subject := "Set Up Your OgaOs Admin Account"
 	html := fmt.Sprintf(`
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -336,7 +411,6 @@ func SendAdminPasswordSetupEmail(to, firstName, token, frontendURL string) {
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-// formatKobo converts kobo to a display Naira string. e.g. 150000 → ₦1,500.00
 func formatKobo(kobo int64) string {
 	naira := kobo / 100
 	rem := kobo % 100

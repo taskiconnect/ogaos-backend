@@ -1,8 +1,8 @@
-// internal/api/handlers/invoice/handler.go
 package invoice
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -27,6 +27,52 @@ func (h *Handler) Create(c *gin.Context) {
 		response.Err(c, err)
 		return
 	}
+	response.Created(c, inv)
+}
+
+// PATCH /invoices/:id
+func (h *Handler) Update(c *gin.Context) {
+	id, ok := shared.ParseID(c, "id")
+	if !ok {
+		return
+	}
+
+	var req svcInvoice.UpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	inv, err := h.service.Update(shared.MustBusinessID(c), id, req)
+	if err != nil {
+		if errors.Is(err, svcInvoice.ErrNotFound) {
+			response.NotFound(c, err.Error())
+			return
+		}
+		response.Err(c, err)
+		return
+	}
+
+	response.OK(c, inv)
+}
+
+// POST /invoices/:id/revise
+func (h *Handler) Revise(c *gin.Context) {
+	id, ok := shared.ParseID(c, "id")
+	if !ok {
+		return
+	}
+
+	inv, err := h.service.Revise(shared.MustBusinessID(c), shared.MustUserID(c), id)
+	if err != nil {
+		if errors.Is(err, svcInvoice.ErrNotFound) {
+			response.NotFound(c, err.Error())
+			return
+		}
+		response.Err(c, err)
+		return
+	}
+
 	response.Created(c, inv)
 }
 
@@ -56,8 +102,6 @@ func (h *Handler) Get(c *gin.Context) {
 	}
 	inv, err := h.service.Get(shared.MustBusinessID(c), id)
 	if err != nil {
-		// FIX: distinguish not-found from internal errors so DB failures
-		// don't masquerade as 404s.
 		if errors.Is(err, svcInvoice.ErrNotFound) {
 			response.NotFound(c, err.Error())
 		} else {
@@ -66,6 +110,72 @@ func (h *Handler) Get(c *gin.Context) {
 		return
 	}
 	response.OK(c, inv)
+}
+
+// GET /public/invoices/:token
+func (h *Handler) GetPublic(c *gin.Context) {
+	token := strings.TrimSpace(c.Param("token"))
+	if token == "" {
+		response.BadRequest(c, "token is required")
+		return
+	}
+
+	inv, err := h.service.GetPublicByToken(token)
+	if err != nil {
+		if errors.Is(err, svcInvoice.ErrNotFound) {
+			response.NotFound(c, "invoice not found")
+		} else {
+			response.InternalError(c, err.Error())
+		}
+		return
+	}
+
+	response.OK(c, inv)
+}
+
+// GET /public/invoices/:token/pdf
+func (h *Handler) DownloadPublicPDF(c *gin.Context) {
+	token := strings.TrimSpace(c.Param("token"))
+	if token == "" {
+		response.BadRequest(c, "token is required")
+		return
+	}
+
+	pdfBytes, filename, err := h.service.BuildPDFForPublicToken(token)
+	if err != nil {
+		if errors.Is(err, svcInvoice.ErrNotFound) {
+			response.NotFound(c, "invoice not found")
+		} else {
+			response.InternalError(c, err.Error())
+		}
+		return
+	}
+
+	c.Header("Content-Type", "application/pdf")
+	c.Header("Content-Disposition", `inline; filename="`+filename+`"`)
+	c.Data(200, "application/pdf", pdfBytes)
+}
+
+// GET /invoices/:id/pdf
+func (h *Handler) DownloadProtectedPDF(c *gin.Context) {
+	id, ok := shared.ParseID(c, "id")
+	if !ok {
+		return
+	}
+
+	pdfBytes, filename, err := h.service.BuildPDFForProtectedInvoice(shared.MustBusinessID(c), id)
+	if err != nil {
+		if errors.Is(err, svcInvoice.ErrNotFound) {
+			response.NotFound(c, err.Error())
+		} else {
+			response.InternalError(c, err.Error())
+		}
+		return
+	}
+
+	c.Header("Content-Type", "application/pdf")
+	c.Header("Content-Disposition", `inline; filename="`+filename+`"`)
+	c.Data(200, "application/pdf", pdfBytes)
 }
 
 // POST /invoices/:id/send

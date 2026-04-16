@@ -96,8 +96,6 @@ func SetupAuthRoutes(
 	public := v1.Group("/public")
 	{
 		// ── Public business discovery/search ─────────────────────────────────
-		// Example:
-		// GET /api/v1/public/business/search?q=tailor&state=Lagos&lga=Ikeja&radius_km=10
 		public.GET("/business/search", publicHandler.SearchBusinesses)
 
 		// ── Business profile ──────────────────────────────────────────────────
@@ -113,7 +111,7 @@ func SetupAuthRoutes(
 		public.GET("/store/:slug", digitalHandler.GetPublicProduct)
 		public.POST("/store/:id/purchase", digitalHandler.Purchase)
 		public.GET("/orders/:order_id/fulfillment", digitalHandler.GetFulfillment)
-		public.GET("/orders/:order_id/download", digitalHandler.GetDownload) // legacy fallback
+		public.GET("/orders/:order_id/download", digitalHandler.GetDownload)
 		public.GET("/downloads/:token", digitalHandler.DownloadByToken)
 
 		// ── Recruitment ───────────────────────────────────────────────────────
@@ -121,6 +119,10 @@ func SetupAuthRoutes(
 		public.GET("/jobs/:slug", recruitmentHandler.GetPublicJob)
 		public.POST("/jobs/:id/apply", recruitmentHandler.Apply)
 		public.POST("/assessment/:app_id/submit", recruitmentHandler.SubmitAssessment)
+
+		// ── Public invoices ───────────────────────────────────────────────────
+		public.GET("/invoices/:token", invoiceHandler.GetPublic)
+		public.GET("/invoices/:token/pdf", invoiceHandler.DownloadPublicPDF)
 	}
 
 	protected := v1.Group("")
@@ -218,6 +220,16 @@ func SetupAuthRoutes(
 		invoices.POST("", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.Create)
 		invoices.GET("", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), invoiceHandler.List)
 		invoices.GET("/:id", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), invoiceHandler.Get)
+
+		// latest editable version while still draft
+		invoices.PATCH("/:id", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.Update)
+
+		// create a new draft revision from an already sent/locked invoice
+		invoices.POST("/:id/revise", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.Revise)
+
+		// business owner/staff can download latest generated PDF for current invoice state
+		invoices.GET("/:id/pdf", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), invoiceHandler.DownloadProtectedPDF)
+
 		invoices.POST("/:id/send", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.Send)
 		invoices.POST("/:id/payment", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.RecordPayment)
 		invoices.DELETE("/:id", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.Cancel)
@@ -259,7 +271,6 @@ func SetupAuthRoutes(
 
 	dp := protected.Group("/digital-products")
 	{
-		// Orders first so they do not conflict with /:id
 		dp.GET("/orders", middleware.RequireRole(middleware.RoleOwner), digitalHandler.ListOrders)
 		dp.GET("/orders/:id", middleware.RequireRole(middleware.RoleOwner), digitalHandler.GetOrder)
 		dp.POST("/orders/:id/resend-access", middleware.RequireRole(middleware.RoleOwner), digitalHandler.ResendAccess)

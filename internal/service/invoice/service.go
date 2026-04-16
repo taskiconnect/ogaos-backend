@@ -1,7 +1,8 @@
-// internal/service/invoice/service.go
 package invoice
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,7 +13,8 @@ import (
 
 	"ogaos-backend/internal/domain/models"
 	"ogaos-backend/internal/pkg/cursor"
-	"ogaos-backend/internal/pkg/email"
+	emailpkg "ogaos-backend/internal/pkg/email"
+	pdfpkg "ogaos-backend/internal/pkg/pdf"
 )
 
 type Service struct {
@@ -21,12 +23,11 @@ type Service struct {
 }
 
 func NewService(db *gorm.DB, frontendURL string) *Service {
-	return &Service{db: db, frontendURL: frontendURL}
+	return &Service{
+		db:          db,
+		frontendURL: strings.TrimRight(frontendURL, "/"),
+	}
 }
-
-// ─── DateOnly ────────────────────────────────────────────────────────────────
-// Accepts "YYYY-MM-DD" from HTML date inputs as well as full RFC-3339 strings.
-// This avoids the `parsing time "2026-04-03" as "…T…"` error.
 
 type DateOnly struct{ time.Time }
 
@@ -35,12 +36,10 @@ func (d *DateOnly) UnmarshalJSON(b []byte) error {
 	if s == "null" || s == "" {
 		return nil
 	}
-	// Try full RFC-3339 first so existing clients keep working.
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
 		d.Time = t
 		return nil
 	}
-	// Fall back to plain date.
 	t, err := time.Parse("2006-01-02", s)
 	if err != nil {
 		return fmt.Errorf("date must be YYYY-MM-DD or RFC-3339, got %q", s)
@@ -49,11 +48,10 @@ func (d *DateOnly) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// ─── DTOs ────────────────────────────────────────────────────────────────────
-
 type InvoiceItemInput struct {
 	ProductID    *uuid.UUID `json:"product_id"`
 	Description  string     `json:"description" binding:"required"`
+	ProductSKU   *string    `json:"product_sku"`
 	UnitPrice    int64      `json:"unit_price" binding:"required,min=1"`
 	Quantity     int        `json:"quantity" binding:"required,min=1"`
 	Discount     int64      `json:"discount"`
@@ -63,8 +61,22 @@ type InvoiceItemInput struct {
 type CreateRequest struct {
 	StoreID        *uuid.UUID         `json:"store_id"`
 	CustomerID     *uuid.UUID         `json:"customer_id"`
-	IssueDate      *DateOnly          `json:"issue_date"` // optional; defaults to now
+	IssueDate      *DateOnly          `json:"issue_date"`
 	DueDate        DateOnly           `json:"due_date" binding:"required"`
+	Items          []InvoiceItemInput `json:"items" binding:"required,min=1"`
+	DiscountAmount int64              `json:"discount_amount"`
+	VATRate        float64            `json:"vat_rate"`
+	VATInclusive   bool               `json:"vat_inclusive"`
+	WHTRate        float64            `json:"wht_rate"`
+	PaymentTerms   *string            `json:"payment_terms"`
+	Notes          *string            `json:"notes"`
+}
+
+type UpdateRequest struct {
+	StoreID        *uuid.UUID         `json:"store_id"`
+	CustomerID     *uuid.UUID         `json:"customer_id"`
+	IssueDate      *DateOnly          `json:"issue_date"`
+	DueDate        *DateOnly          `json:"due_date"`
 	Items          []InvoiceItemInput `json:"items" binding:"required,min=1"`
 	DiscountAmount int64              `json:"discount_amount"`
 	VATRate        float64            `json:"vat_rate"`
@@ -83,13 +95,8 @@ type ListFilter struct {
 	Limit      int
 }
 
-// ─── Sentinel errors ──────────────────────────────────────────────────────────
-
-// ErrNotFound is returned when an invoice does not exist or belongs to a
-// different business. The handler maps this to a 404; all other errors → 500.
 var ErrNotFound = errors.New("invoice not found")
-
-// ─── Methods ─────────────────────────────────────────────────────────────────
+var ErrInvoiceLocked = errors.New("invoice can no longer be edited directly; create a revision instead")
 
 func (s *Service) Create(businessID, createdBy uuid.UUID, req CreateRequest) (*models.Invoice, error) {
 	invoiceNumber, err := s.nextInvoiceNumber(businessID)
@@ -97,21 +104,12 @@ func (s *Service) Create(businessID, createdBy uuid.UUID, req CreateRequest) (*m
 		return nil, err
 	}
 
-	var subTotal int64
-	var items []models.InvoiceItem
-	for _, item := range req.Items {
-		lineTotal := (item.UnitPrice * int64(item.Quantity)) - item.Discount
-		items = append(items, models.InvoiceItem{
-			ProductID:    item.ProductID,
-			Description:  item.Description,
-			UnitPrice:    item.UnitPrice,
-			Quantity:     item.Quantity,
-			Discount:     item.Discount,
-			TotalPrice:   lineTotal,
-			VATInclusive: item.VATInclusive,
-		})
-		subTotal += lineTotal
+	token, err := generatePublicToken()
+	if err != nil {
+		return nil, err
 	}
+
+	items, subTotal := buildInvoiceItems(req.Items)
 
 	issueDate := time.Now()
 	if req.IssueDate != nil && !req.IssueDate.IsZero() {
@@ -124,6 +122,8 @@ func (s *Service) Create(businessID, createdBy uuid.UUID, req CreateRequest) (*m
 		CustomerID:     req.CustomerID,
 		CreatedBy:      createdBy,
 		InvoiceNumber:  invoiceNumber,
+		PublicToken:    token,
+		RevisionNumber: 1,
 		IssueDate:      issueDate,
 		DueDate:        req.DueDate.Time,
 		SubTotal:       subTotal,
@@ -135,8 +135,6 @@ func (s *Service) Create(businessID, createdBy uuid.UUID, req CreateRequest) (*m
 		Notes:          req.Notes,
 		Status:         models.InvoiceStatusDraft,
 	}
-	// FIX: call CalculateTotal once — it calls CalculateVAT/CalculateWHT internally.
-	// Previously CalculateVAT+CalculateWHT were called separately AND inside CalculateTotal.
 	inv.CalculateTotal()
 
 	err = s.db.Transaction(func(tx *gorm.DB) error {
@@ -151,13 +149,190 @@ func (s *Service) Create(businessID, createdBy uuid.UUID, req CreateRequest) (*m
 	if err != nil {
 		return nil, err
 	}
+
 	inv.InvoiceItems = items
 	return &inv, nil
 }
 
+func (s *Service) Update(businessID, invoiceID uuid.UUID, req UpdateRequest) (*models.Invoice, error) {
+	var inv models.Invoice
+	if err := s.db.
+		Where("id = ? AND business_id = ?", invoiceID, businessID).
+		Preload("InvoiceItems").
+		First(&inv).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	if !inv.IsEditable() {
+		return nil, ErrInvoiceLocked
+	}
+
+	items, subTotal := buildInvoiceItems(req.Items)
+
+	if req.StoreID != nil || inv.StoreID != nil {
+		inv.StoreID = req.StoreID
+	}
+	if req.CustomerID != nil || inv.CustomerID != nil {
+		inv.CustomerID = req.CustomerID
+	}
+	if req.IssueDate != nil && !req.IssueDate.IsZero() {
+		inv.IssueDate = req.IssueDate.Time
+	}
+	if req.DueDate != nil && !req.DueDate.IsZero() {
+		inv.DueDate = req.DueDate.Time
+	}
+
+	inv.SubTotal = subTotal
+	inv.DiscountAmount = req.DiscountAmount
+	inv.VATRate = req.VATRate
+	inv.VATInclusive = req.VATInclusive
+	inv.WHTRate = req.WHTRate
+	inv.PaymentTerms = req.PaymentTerms
+	inv.Notes = req.Notes
+	inv.CalculateTotal()
+
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.Invoice{}).
+			Where("id = ? AND business_id = ?", inv.ID, businessID).
+			Updates(map[string]interface{}{
+				"store_id":        inv.StoreID,
+				"customer_id":     inv.CustomerID,
+				"issue_date":      inv.IssueDate,
+				"due_date":        inv.DueDate,
+				"sub_total":       inv.SubTotal,
+				"discount_amount": inv.DiscountAmount,
+				"vat_rate":        inv.VATRate,
+				"vat_inclusive":   inv.VATInclusive,
+				"vat_amount":      inv.VATAmount,
+				"wht_rate":        inv.WHTRate,
+				"wht_amount":      inv.WHTAmount,
+				"total_amount":    inv.TotalAmount,
+				"balance_due":     inv.BalanceDue,
+				"payment_terms":   inv.PaymentTerms,
+				"notes":           inv.Notes,
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Where("invoice_id = ?", inv.ID).Delete(&models.InvoiceItem{}).Error; err != nil {
+			return err
+		}
+		for i := range items {
+			items[i].InvoiceID = inv.ID
+		}
+		return tx.Create(&items).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	inv.InvoiceItems = items
+	return &inv, nil
+}
+
+func (s *Service) Revise(businessID, createdBy, invoiceID uuid.UUID) (*models.Invoice, error) {
+	var original models.Invoice
+	if err := s.db.
+		Where("id = ? AND business_id = ?", invoiceID, businessID).
+		Preload("InvoiceItems").
+		First(&original).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	if original.Status == models.InvoiceStatusCancelled || original.Status == models.InvoiceStatusSuperseded {
+		return nil, errors.New("invoice cannot be revised in its current state")
+	}
+
+	if original.SupersededByInvoiceID != nil {
+		return nil, errors.New("invoice has already been revised")
+	}
+
+	newNumber, err := s.nextInvoiceNumber(businessID)
+	if err != nil {
+		return nil, err
+	}
+
+	token, err := generatePublicToken()
+	if err != nil {
+		return nil, err
+	}
+
+	newInv := models.Invoice{
+		BusinessID:           original.BusinessID,
+		StoreID:              original.StoreID,
+		CustomerID:           original.CustomerID,
+		CreatedBy:            createdBy,
+		InvoiceNumber:        newNumber,
+		PublicToken:          token,
+		RevisionNumber:       original.RevisionNumber + 1,
+		RevisedFromInvoiceID: &original.ID,
+		IssueDate:            time.Now(),
+		DueDate:              original.DueDate,
+		SubTotal:             original.SubTotal,
+		DiscountAmount:       original.DiscountAmount,
+		VATRate:              original.VATRate,
+		VATInclusive:         original.VATInclusive,
+		VATAmount:            original.VATAmount,
+		WHTRate:              original.WHTRate,
+		WHTAmount:            original.WHTAmount,
+		TotalAmount:          original.TotalAmount,
+		AmountPaid:           0,
+		BalanceDue:           original.TotalAmount,
+		Currency:             original.Currency,
+		Status:               models.InvoiceStatusDraft,
+		PaymentTerms:         original.PaymentTerms,
+		Notes:                original.Notes,
+	}
+
+	items := make([]models.InvoiceItem, 0, len(original.InvoiceItems))
+	for _, item := range original.InvoiceItems {
+		items = append(items, models.InvoiceItem{
+			ProductID:    item.ProductID,
+			Description:  item.Description,
+			ProductSKU:   item.ProductSKU,
+			UnitPrice:    item.UnitPrice,
+			Quantity:     item.Quantity,
+			Discount:     item.Discount,
+			TotalPrice:   item.TotalPrice,
+			VATInclusive: item.VATInclusive,
+		})
+	}
+
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&newInv).Error; err != nil {
+			return err
+		}
+		for i := range items {
+			items[i].InvoiceID = newInv.ID
+		}
+		if err := tx.Create(&items).Error; err != nil {
+			return err
+		}
+		return tx.Model(&models.Invoice{}).
+			Where("id = ? AND business_id = ?", original.ID, businessID).
+			Updates(map[string]interface{}{
+				"status":                   models.InvoiceStatusSuperseded,
+				"superseded_by_invoice_id": newInv.ID,
+			}).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	newInv.InvoiceItems = items
+	return &newInv, nil
+}
+
 func (s *Service) Get(businessID, invoiceID uuid.UUID) (*models.Invoice, error) {
 	var inv models.Invoice
-	err := s.db.Where("id = ? AND business_id = ?", invoiceID, businessID).
+	err := s.db.
+		Where("id = ? AND business_id = ?", invoiceID, businessID).
 		Preload("InvoiceItems").
 		Preload("Customer").
 		First(&inv).Error
@@ -170,12 +345,77 @@ func (s *Service) Get(businessID, invoiceID uuid.UUID) (*models.Invoice, error) 
 	return &inv, nil
 }
 
+func (s *Service) GetPublicByToken(token string) (*models.Invoice, error) {
+	var inv models.Invoice
+	err := s.db.
+		Where("public_token = ?", token).
+		Preload("InvoiceItems").
+		Preload("Customer").
+		Preload("Business").
+		First(&inv).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	switch inv.Status {
+	case models.InvoiceStatusCancelled, models.InvoiceStatusSuperseded:
+		return nil, ErrNotFound
+	}
+
+	return &inv, nil
+}
+
+func (s *Service) BuildPDFForInvoice(inv *models.Invoice) ([]byte, string, error) {
+	businessName := "Business"
+	if inv.Business.Name != "" {
+		businessName = inv.Business.Name
+	}
+
+	pdf, err := pdfpkg.BuildInvoicePDF(inv, businessName)
+	if err != nil {
+		return nil, "", err
+	}
+
+	filename := fmt.Sprintf("%s-rev-%d.pdf", inv.InvoiceNumber, inv.RevisionNumber)
+	filename = strings.ReplaceAll(filename, " ", "-")
+	return pdf, filename, nil
+}
+
+func (s *Service) BuildPDFForProtectedInvoice(businessID, invoiceID uuid.UUID) ([]byte, string, error) {
+	var inv models.Invoice
+	err := s.db.
+		Where("id = ? AND business_id = ?", invoiceID, businessID).
+		Preload("InvoiceItems").
+		Preload("Customer").
+		Preload("Business").
+		First(&inv).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, "", ErrNotFound
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	return s.BuildPDFForInvoice(&inv)
+}
+
+func (s *Service) BuildPDFForPublicToken(token string) ([]byte, string, error) {
+	inv, err := s.GetPublicByToken(token)
+	if err != nil {
+		return nil, "", err
+	}
+	return s.BuildPDFForInvoice(inv)
+}
+
 func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Invoice, string, error) {
 	if filter.Limit < 1 || filter.Limit > 100 {
 		filter.Limit = 20
 	}
 
 	q := s.db.Model(&models.Invoice{}).Where("business_id = ?", businessID)
+
 	if filter.Status != "" {
 		q = q.Where("status = ?", filter.Status)
 	}
@@ -188,7 +428,6 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Invoic
 	if filter.DateTo != nil {
 		q = q.Where("issue_date <= ?", *filter.DateTo)
 	}
-
 	if filter.Cursor != "" {
 		cur, id, err := cursor.Decode(filter.Cursor)
 		if err != nil {
@@ -208,22 +447,26 @@ func (s *Service) List(businessID uuid.UUID, filter ListFilter) ([]models.Invoic
 		nextCursor = cursor.Encode(last.CreatedAt, last.ID)
 		invoices = invoices[:filter.Limit]
 	}
+
 	return invoices, nextCursor, nil
 }
 
-// Send marks an invoice as sent and emails the customer.
 func (s *Service) Send(businessID, invoiceID uuid.UUID) (*models.Invoice, error) {
 	var inv models.Invoice
-	if err := s.db.Where("id = ? AND business_id = ?", invoiceID, businessID).
-		Preload("Customer").Preload("Business").First(&inv).Error; err != nil {
+	if err := s.db.
+		Where("id = ? AND business_id = ?", invoiceID, businessID).
+		Preload("Customer").
+		Preload("Business").
+		Preload("InvoiceItems").
+		First(&inv).Error; err != nil {
 		return nil, ErrNotFound
 	}
-	if inv.Status == models.InvoiceStatusCancelled {
-		return nil, errors.New("cannot send a cancelled invoice")
+
+	if inv.Status == models.InvoiceStatusCancelled || inv.Status == models.InvoiceStatusSuperseded {
+		return nil, errors.New("cannot send this invoice in its current state")
 	}
 
 	now := time.Now()
-	// FIX: error was silently discarded before.
 	if err := s.db.Model(&inv).Updates(map[string]interface{}{
 		"status":  models.InvoiceStatusSent,
 		"sent_at": now,
@@ -233,30 +476,39 @@ func (s *Service) Send(businessID, invoiceID uuid.UUID) (*models.Invoice, error)
 	inv.Status = models.InvoiceStatusSent
 	inv.SentAt = &now
 
-	// FIX: fire email in a goroutine — a slow/failing mail server no longer
-	// blocks the HTTP response.
 	if inv.Customer != nil && inv.Customer.Email != nil {
-		viewURL := fmt.Sprintf("%s/invoices/%s", s.frontendURL, inv.ID)
-		go email.SendInvoice(
+		viewURL := fmt.Sprintf("%s/public/invoices/%s", s.frontendURL, inv.PublicToken)
+		pdfBytes, filename, err := s.BuildPDFForInvoice(&inv)
+		if err != nil {
+			return nil, err
+		}
+
+		customerName := strings.TrimSpace(inv.Customer.FirstName + " " + inv.Customer.LastName)
+		if customerName == "" {
+			customerName = "Customer"
+		}
+
+		go emailpkg.SendInvoice(
 			*inv.Customer.Email,
-			inv.Customer.FirstName+" "+inv.Customer.LastName,
+			customerName,
 			inv.Business.Name,
 			inv.InvoiceNumber,
 			viewURL,
+			pdfBytes,
+			filename,
 		)
 	}
 
 	return &inv, nil
 }
 
-// RecordPayment records a payment against an invoice and updates its status.
 func (s *Service) RecordPayment(businessID, invoiceID uuid.UUID, amountPaid int64) (*models.Invoice, error) {
 	var inv models.Invoice
 	if err := s.db.Where("id = ? AND business_id = ?", invoiceID, businessID).First(&inv).Error; err != nil {
 		return nil, ErrNotFound
 	}
-	if inv.Status == models.InvoiceStatusCancelled {
-		return nil, errors.New("cannot record payment on a cancelled invoice")
+	if inv.Status == models.InvoiceStatusCancelled || inv.Status == models.InvoiceStatusSuperseded {
+		return nil, errors.New("cannot record payment on this invoice")
 	}
 	if inv.Status == models.InvoiceStatusPaid {
 		return nil, errors.New("invoice is already fully paid")
@@ -279,20 +531,21 @@ func (s *Service) RecordPayment(businessID, invoiceID uuid.UUID, amountPaid int6
 		updates["status"] = models.InvoiceStatusPartial
 	}
 
-	// FIX: error was silently discarded before.
 	if err := s.db.Model(&inv).Updates(updates).Error; err != nil {
 		return nil, err
 	}
-	return &inv, nil
+	return s.Get(businessID, invoiceID)
 }
 
-// Cancel cancels a draft, sent, or overdue invoice.
 func (s *Service) Cancel(businessID, invoiceID uuid.UUID) error {
 	result := s.db.Model(&models.Invoice{}).
 		Where("id = ? AND business_id = ? AND status IN ?", invoiceID, businessID, []string{
-			models.InvoiceStatusDraft, models.InvoiceStatusSent, models.InvoiceStatusOverdue,
+			models.InvoiceStatusDraft,
+			models.InvoiceStatusSent,
+			models.InvoiceStatusOverdue,
 		}).
 		Update("status", models.InvoiceStatusCancelled)
+
 	if result.Error != nil {
 		return result.Error
 	}
@@ -302,25 +555,19 @@ func (s *Service) Cancel(businessID, invoiceID uuid.UUID) error {
 	return nil
 }
 
-// MarkOverdue updates all sent invoices past their due date to overdue.
-// Called by a scheduled job daily.
 func (s *Service) MarkOverdue() error {
 	return s.db.Model(&models.Invoice{}).
 		Where("status = ? AND due_date < ?", models.InvoiceStatusSent, time.Now()).
 		Update("status", models.InvoiceStatusOverdue).Error
 }
 
-// ─── Number generation ────────────────────────────────────────────────────────
-
-// nextInvoiceNumber generates the next sequential invoice number for the
-// business in the current month, e.g. INV-202604-0001.
-// NOTE: this is still an optimistic read-then-write. The unique index on
-// invoice_number will reject true duplicates; callers should retry on conflict.
 func (s *Service) nextInvoiceNumber(businessID uuid.UUID) (string, error) {
 	prefix := fmt.Sprintf("INV-%s-", time.Now().Format("200601"))
 	var last models.Invoice
-	err := s.db.Where("business_id = ? AND invoice_number LIKE ?", businessID, prefix+"%").
-		Order("invoice_number DESC").First(&last).Error
+	err := s.db.
+		Where("business_id = ? AND invoice_number LIKE ?", businessID, prefix+"%").
+		Order("invoice_number DESC").
+		First(&last).Error
 
 	seq := 1
 	if err == nil {
@@ -328,4 +575,34 @@ func (s *Service) nextInvoiceNumber(businessID uuid.UUID) (string, error) {
 		seq++
 	}
 	return fmt.Sprintf("%s%04d", prefix, seq), nil
+}
+
+func buildInvoiceItems(inputs []InvoiceItemInput) ([]models.InvoiceItem, int64) {
+	items := make([]models.InvoiceItem, 0, len(inputs))
+	var subTotal int64
+
+	for _, item := range inputs {
+		lineTotal := (item.UnitPrice * int64(item.Quantity)) - item.Discount
+		items = append(items, models.InvoiceItem{
+			ProductID:    item.ProductID,
+			Description:  item.Description,
+			ProductSKU:   item.ProductSKU,
+			UnitPrice:    item.UnitPrice,
+			Quantity:     item.Quantity,
+			Discount:     item.Discount,
+			TotalPrice:   lineTotal,
+			VATInclusive: item.VATInclusive,
+		})
+		subTotal += lineTotal
+	}
+
+	return items, subTotal
+}
+
+func generatePublicToken() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("failed to generate public token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
