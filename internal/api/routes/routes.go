@@ -16,6 +16,7 @@ import (
 	handlerHealth "ogaos-backend/internal/api/handlers/health"
 	handlerInvoice "ogaos-backend/internal/api/handlers/invoice"
 	handlerLocation "ogaos-backend/internal/api/handlers/location"
+	handlerPayout "ogaos-backend/internal/api/handlers/payout"
 	handlerProduct "ogaos-backend/internal/api/handlers/product"
 	handlerPublic "ogaos-backend/internal/api/handlers/public"
 	handlerRecruitment "ogaos-backend/internal/api/handlers/recruitment"
@@ -50,6 +51,7 @@ func SetupAuthRoutes(
 	subscriptionHandler *handlerSubscription.Handler,
 	adminAuthHandler *handlerAdminAuth.Handler,
 	publicHandler *handlerPublic.Handler,
+	payoutHandler *handlerPayout.Handler,
 ) {
 	userSecret := []byte(cfg.JWTSecret)
 	adminSecret := []byte(cfg.AdminJWTSecret)
@@ -95,32 +97,31 @@ func SetupAuthRoutes(
 
 	public := v1.Group("/public")
 	{
-		// ── Public business discovery/search ─────────────────────────────────
 		public.GET("/business/search", publicHandler.SearchBusinesses)
 
-		// ── Business profile ──────────────────────────────────────────────────
 		public.GET("/business/:slug", businessHandler.GetPublicProfile)
 		public.GET("/business/:slug/keywords", businessHandler.GetPublicKeywords)
 		public.GET("/keywords/suggestions", businessHandler.SuggestPublicKeywords)
 
-		// ── Aggregated storefront page ────────────────────────────────────────
 		public.GET("/business/:slug/full", publicHandler.GetFullBusinessPage)
 
-		// ── Digital storefront ────────────────────────────────────────────────
+		public.GET("/digital-store/:slug", digitalHandler.ListPublicStore)
+		public.GET("/digital-store/product/:slug", digitalHandler.GetPublicStoreProduct)
+		public.POST("/digital-store/:id/initialize-payment", digitalHandler.InitializePayment)
+		public.GET("/digital-orders/:order_id/fulfillment", digitalHandler.GetFulfillment)
+		public.GET("/digital-downloads/:token", digitalHandler.DownloadByToken)
+
 		public.GET("/business/:slug/products", digitalHandler.ListPublicProducts)
 		public.GET("/store/:slug", digitalHandler.GetPublicProduct)
-		public.POST("/store/:id/purchase", digitalHandler.Purchase)
 		public.GET("/orders/:order_id/fulfillment", digitalHandler.GetFulfillment)
 		public.GET("/orders/:order_id/download", digitalHandler.GetDownload)
 		public.GET("/downloads/:token", digitalHandler.DownloadByToken)
 
-		// ── Recruitment ───────────────────────────────────────────────────────
 		public.GET("/jobs", recruitmentHandler.ListPublicJobs)
 		public.GET("/jobs/:slug", recruitmentHandler.GetPublicJob)
 		public.POST("/jobs/:id/apply", recruitmentHandler.Apply)
 		public.POST("/assessment/:app_id/submit", recruitmentHandler.SubmitAssessment)
 
-		// ── Public invoices ───────────────────────────────────────────────────
 		public.GET("/invoices/:token", invoiceHandler.GetPublic)
 		public.GET("/invoices/:token/pdf", invoiceHandler.DownloadPublicPDF)
 	}
@@ -221,13 +222,8 @@ func SetupAuthRoutes(
 		invoices.GET("", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), invoiceHandler.List)
 		invoices.GET("/:id", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), invoiceHandler.Get)
 
-		// latest editable version while still draft
 		invoices.PATCH("/:id", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.Update)
-
-		// create a new draft revision from an already sent/locked invoice
 		invoices.POST("/:id/revise", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.Revise)
-
-		// business owner/staff can download latest generated PDF for current invoice state
 		invoices.GET("/:id/pdf", middleware.RequireRole(middleware.RoleOwner, middleware.RoleStaff), invoiceHandler.DownloadProtectedPDF)
 
 		invoices.POST("/:id/send", middleware.RequireRole(middleware.RoleOwner), invoiceHandler.Send)
@@ -284,6 +280,18 @@ func SetupAuthRoutes(
 		dp.POST("/:id/cover", middleware.RequireRole(middleware.RoleOwner), digitalHandler.UploadCover)
 		dp.POST("/:id/gallery", middleware.RequireRole(middleware.RoleOwner), digitalHandler.AddGalleryImage)
 		dp.DELETE("/:id/gallery/:index", middleware.RequireRole(middleware.RoleOwner), digitalHandler.RemoveGalleryImage)
+	}
+
+	payout := protected.Group("/payout")
+	payout.Use(middleware.RequireRole(middleware.RoleOwner))
+	{
+		payout.GET("/banks", payoutHandler.ListBanks)
+		payout.POST("/resolve", payoutHandler.ResolveAccount)
+		payout.POST("/verify/start", payoutHandler.StartVerification)
+		payout.POST("/verify/resend", payoutHandler.ResendVerification)
+		payout.POST("/verify/confirm", payoutHandler.ConfirmVerification)
+		payout.GET("/account", payoutHandler.GetDefaultAccount)
+		payout.GET("/verify/pending", payoutHandler.GetPendingVerification)
 	}
 
 	subs := protected.Group("/subscriptions")

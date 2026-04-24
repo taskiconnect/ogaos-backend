@@ -4,15 +4,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"ogaos-backend/internal/domain/models"
 	"ogaos-backend/internal/external/imagekit"
+	"ogaos-backend/internal/external/paystack"
 	"ogaos-backend/internal/pkg/cursor"
 	"ogaos-backend/internal/pkg/email"
 )
@@ -59,11 +62,39 @@ type UpdateRequest struct {
 	DeliveryNote        *string `json:"delivery_note"`
 }
 
-type PurchaseRequest struct {
-	BuyerName  string `json:"buyer_name" binding:"required"`
-	BuyerEmail string `json:"buyer_email" binding:"required,email"`
-	Reference  string `json:"reference" binding:"required"`
-	Channel    string `json:"channel" binding:"required"`
+type InitializeCheckoutRequest struct {
+	BuyerName   string  `json:"buyer_name" binding:"required"`
+	BuyerEmail  string  `json:"buyer_email" binding:"required,email"`
+	BuyerPhone  *string `json:"buyer_phone"`
+	CallbackURL *string `json:"callback_url"`
+}
+
+type InitializeCheckoutResponse struct {
+	Message           string    `json:"message"`
+	OrderID           uuid.UUID `json:"order_id"`
+	Reference         string    `json:"reference"`
+	AuthorizationURL  string    `json:"authorization_url"`
+	AccessCode        string    `json:"access_code"`
+	Amount            int64     `json:"amount"`
+	Currency          string    `json:"currency"`
+	PlatformFee       int64     `json:"platform_fee"`
+	OwnerPayoutAmount int64     `json:"owner_payout_amount"`
+}
+
+type PublicBusinessInfo struct {
+	Name    string  `json:"name"`
+	Slug    string  `json:"slug"`
+	LogoURL *string `json:"logo_url"`
+}
+
+type PublicProductResponse struct {
+	models.DigitalProduct
+	Business PublicBusinessInfo `json:"business"`
+}
+
+type PublicDigitalStoreResponse struct {
+	Business PublicBusinessInfo      `json:"business"`
+	Products []models.DigitalProduct `json:"products"`
 }
 
 type FulfillmentResponse struct {
@@ -91,10 +122,22 @@ type PurchaseResult struct {
 	Fulfillment   FulfillmentResponse `json:"fulfillment"`
 }
 
+type ownerContact struct {
+	UserID    uuid.UUID
+	Email     string
+	FirstName string
+}
+
 func (s *Service) Create(businessID uuid.UUID, req CreateRequest) (*models.DigitalProduct, error) {
 	mode := s.defaultFulfillmentMode(req.Type, req.FulfillmentMode)
 	if err := s.validateFulfillmentMode(mode); err != nil {
 		return nil, err
+	}
+
+	if req.AccessRedirectURL != nil && strings.TrimSpace(*req.AccessRedirectURL) != "" {
+		if !isValidHTTPSURL(*req.AccessRedirectURL) {
+			return nil, errors.New("access_redirect_url must be a valid https URL")
+		}
 	}
 
 	requiresAccount := false
@@ -104,8 +147,8 @@ func (s *Service) Create(businessID uuid.UUID, req CreateRequest) (*models.Digit
 
 	p := models.DigitalProduct{
 		BusinessID:          businessID,
-		Title:               req.Title,
-		Slug:                s.generateSlug(req.Title),
+		Title:               strings.TrimSpace(req.Title),
+		Slug:                s.generateUniqueProductCode(),
 		Description:         req.Description,
 		Type:                req.Type,
 		Price:               req.Price,
@@ -132,29 +175,55 @@ func (s *Service) Get(businessID, productID uuid.UUID) (*models.DigitalProduct, 
 	return &p, nil
 }
 
-func (s *Service) GetPublic(slug string) (*models.DigitalProduct, error) {
+func (s *Service) GetPublic(slug string) (*PublicProductResponse, error) {
 	var p models.DigitalProduct
-	if err := s.db.Where("slug = ? AND is_published = true", slug).First(&p).Error; err != nil {
+	if err := s.db.
+		Model(&models.DigitalProduct{}).
+		Joins("JOIN businesses ON businesses.id = digital_products.business_id").
+		Where("digital_products.slug = ? AND digital_products.is_published = true AND businesses.is_profile_public = true", strings.TrimSpace(slug)).
+		Preload("Business").
+		First(&p).Error; err != nil {
 		return nil, errors.New("product not found")
 	}
-	return &p, nil
+
+	return &PublicProductResponse{
+		DigitalProduct: p,
+		Business: PublicBusinessInfo{
+			Name:    p.Business.Name,
+			Slug:    p.Business.Slug,
+			LogoURL: p.Business.LogoURL,
+		},
+	}, nil
 }
 
-func (s *Service) ListPublic(businessSlug string) ([]models.DigitalProduct, error) {
+func (s *Service) ListPublic(businessSlug string) (*PublicDigitalStoreResponse, error) {
 	var b models.Business
-	if err := s.db.Select("id").
+	if err := s.db.Select("id, name, slug, logo_url").
 		Where("slug = ? AND is_profile_public = true", businessSlug).
 		First(&b).Error; err != nil {
 		return nil, errors.New("business not found")
 	}
 
 	var products []models.DigitalProduct
-	err := s.db.
+	if err := s.db.
 		Where("business_id = ? AND is_published = true", b.ID).
 		Order("created_at DESC").
-		Find(&products).Error
+		Find(&products).Error; err != nil {
+		return nil, err
+	}
 
-	return products, err
+	if products == nil {
+		products = []models.DigitalProduct{}
+	}
+
+	return &PublicDigitalStoreResponse{
+		Business: PublicBusinessInfo{
+			Name:    b.Name,
+			Slug:    b.Slug,
+			LogoURL: b.LogoURL,
+		},
+		Products: products,
+	}, nil
 }
 
 func (s *Service) List(businessID uuid.UUID, cur string, limit int) ([]models.DigitalProduct, string, error) {
@@ -196,7 +265,7 @@ func (s *Service) Update(businessID, productID uuid.UUID, req UpdateRequest) (*m
 	updates := map[string]interface{}{}
 
 	if req.Title != nil {
-		updates["title"] = *req.Title
+		updates["title"] = strings.TrimSpace(*req.Title)
 	}
 	if req.Description != nil {
 		updates["description"] = *req.Description
@@ -215,6 +284,9 @@ func (s *Service) Update(businessID, productID uuid.UUID, req UpdateRequest) (*m
 		p.FulfillmentMode = *req.FulfillmentMode
 	}
 	if req.AccessRedirectURL != nil {
+		if strings.TrimSpace(*req.AccessRedirectURL) != "" && !isValidHTTPSURL(*req.AccessRedirectURL) {
+			return nil, errors.New("access_redirect_url must be a valid https URL")
+		}
 		updates["access_redirect_url"] = *req.AccessRedirectURL
 		p.AccessRedirectURL = req.AccessRedirectURL
 	}
@@ -227,7 +299,7 @@ func (s *Service) Update(businessID, productID uuid.UUID, req UpdateRequest) (*m
 		p.AccessDurationHours = req.AccessDurationHours
 	}
 	if req.DeliveryNote != nil {
-		updates["delivery_note"] = *req.DeliveryNote
+		updates["delivery_note"] = req.DeliveryNote
 		p.DeliveryNote = req.DeliveryNote
 	}
 	if req.IsPublished != nil {
@@ -237,6 +309,10 @@ func (s *Service) Update(businessID, productID uuid.UUID, req UpdateRequest) (*m
 			}
 		}
 		updates["is_published"] = *req.IsPublished
+	}
+
+	if len(updates) == 0 {
+		return s.Get(businessID, productID)
 	}
 
 	if err := s.db.Model(&models.DigitalProduct{}).
@@ -318,7 +394,6 @@ func (s *Service) RemoveGalleryImage(businessID, productID uuid.UUID, index int)
 	return &p, nil
 }
 
-// kept for backward compatibility with any scheduler that may still call it
 func (s *Service) ExpireOldProducts() (int64, error) {
 	return 0, nil
 }
@@ -401,126 +476,537 @@ func (s *Service) ResendAccessLink(businessID, orderID uuid.UUID) (string, error
 	return completionURL, nil
 }
 
-func (s *Service) CompletePurchase(productID uuid.UUID, req PurchaseRequest) (*PurchaseResult, error) {
-	// idempotency by payment reference
-	if req.Reference != "" {
-		var existing models.DigitalOrder
-		err := s.db.
-			Where("payment_reference = ?", req.Reference).
-			Preload("DigitalProduct").
-			First(&existing).Error
-
-		if err == nil {
-			return s.buildPurchaseResult(&existing), nil
-		}
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, err
-		}
+func (s *Service) InitializePublicCheckout(productID uuid.UUID, req InitializeCheckoutRequest) (*InitializeCheckoutResponse, error) {
+	if req.CallbackURL != nil && strings.TrimSpace(*req.CallbackURL) != "" && !isValidHTTPSURL(*req.CallbackURL) {
+		return nil, errors.New("callback_url must be a valid https URL")
 	}
 
 	var p models.DigitalProduct
-	if err := s.db.Preload("Business").First(&p, productID).Error; err != nil {
-		return nil, errors.New("product not found")
+	if err := s.db.
+		Model(&models.DigitalProduct{}).
+		Joins("JOIN businesses ON businesses.id = digital_products.business_id").
+		Where("digital_products.id = ? AND digital_products.is_published = true AND businesses.is_profile_public = true", productID).
+		Preload("Business").
+		First(&p).Error; err != nil {
+		return nil, errors.New("product not found or not available for public checkout")
 	}
-	if !p.IsPublished {
-		return nil, errors.New("product is not available for purchase")
-	}
+
 	if err := s.validateProductForPublishing(&p); err != nil {
 		return nil, err
 	}
 
-	status, granted, accessURL, err := s.resolveFulfillment(&p)
-	if err != nil {
-		return nil, err
-	}
-
-	accessToken := uuid.NewString()
-	now := time.Now()
-
-	var accessExpiry *time.Time
-	if p.AccessDurationHours != nil && *p.AccessDurationHours > 0 {
-		t := now.Add(time.Duration(*p.AccessDurationHours) * time.Hour)
-		accessExpiry = &t
-	}
+	reference := s.generatePaymentReference()
+	orderID := uuid.New()
 
 	order := models.DigitalOrder{
-		DigitalProductID:  productID,
+		ID:                orderID,
+		DigitalProductID:  p.ID,
 		BusinessID:        p.BusinessID,
-		BuyerName:         req.BuyerName,
-		BuyerEmail:        req.BuyerEmail,
+		BuyerName:         strings.TrimSpace(req.BuyerName),
+		BuyerEmail:        strings.ToLower(strings.TrimSpace(req.BuyerEmail)),
+		BuyerPhone:        req.BuyerPhone,
 		AmountPaid:        p.Price,
 		Currency:          p.Currency,
-		PaymentChannel:    req.Channel,
-		PaymentReference:  &req.Reference,
-		PaymentStatus:     models.OrderPaymentStatusSuccessful,
-		PaidAt:            &now,
+		PaymentChannel:    "paystack",
+		PaymentReference:  &reference,
+		PaymentStatus:     models.OrderPaymentStatusPending,
 		FulfillmentMode:   p.FulfillmentMode,
-		FulfillmentStatus: status,
-		AccessGranted:     granted,
-		AccessToken:       &accessToken,
-		AccessExpiresAt:   accessExpiry,
-		AccessURL:         accessURL,
+		FulfillmentStatus: models.DigitalFulfillmentStatusPending,
+		AccessGranted:     false,
 		PayoutStatus:      models.PayoutStatusPending,
 	}
 	order.CalculateFees()
 
-	if err := s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&order).Error; err != nil {
-			return err
-		}
-
-		return tx.Model(&models.DigitalProduct{}).
-			Where("id = ?", productID).
-			Updates(map[string]interface{}{
-				"sales_count":   gorm.Expr("sales_count + 1"),
-				"total_revenue": gorm.Expr("total_revenue + ?", order.OwnerPayoutAmount),
-			}).Error
-	}); err != nil {
+	if err := s.db.Create(&order).Error; err != nil {
 		return nil, err
 	}
 
-	completionURL := s.buildCompletionURL(order.ID, accessToken)
+	client, err := s.paystackClient()
+	if err != nil {
+		_ = s.db.Delete(&models.DigitalOrder{}, "id = ?", order.ID).Error
+		return nil, err
+	}
 
-	email.SendDigitalProductAccess(
-		req.BuyerEmail,
-		req.BuyerName,
-		p.Title,
-		p.Business.Name,
-		completionURL,
-	)
+	callbackURL := s.buildDefaultCheckoutCallback(reference)
+	if req.CallbackURL != nil && strings.TrimSpace(*req.CallbackURL) != "" {
+		callbackURL = strings.TrimSpace(*req.CallbackURL)
+	}
 
-	order.DigitalProduct = p
-	return &PurchaseResult{
-		Message:       "Purchase completed successfully",
-		OrderID:       order.ID,
-		AccessToken:   order.AccessToken,
-		CompletionURL: completionURL,
-		Fulfillment:   s.buildFulfillmentResponse(&order),
+	initResp, err := client.InitializeTransaction(paystack.InitializeTransactionRequest{
+		Email:     order.BuyerEmail,
+		Amount:    order.AmountPaid,
+		Reference: reference,
+		Callback:  callbackURL,
+		Metadata: map[string]interface{}{
+			"type":                "digital_product",
+			"order_id":            order.ID.String(),
+			"digital_product_id":  p.ID.String(),
+			"business_id":         p.BusinessID.String(),
+			"buyer_name":          order.BuyerName,
+			"buyer_email":         order.BuyerEmail,
+			"platform_fee":        order.PlatformFee,
+			"owner_payout_amount": order.OwnerPayoutAmount,
+		},
+	})
+	if err != nil {
+		_ = s.db.Delete(&models.DigitalOrder{}, "id = ?", order.ID).Error
+		return nil, err
+	}
+
+	return &InitializeCheckoutResponse{
+		Message:           "payment initialized successfully",
+		OrderID:           order.ID,
+		Reference:         reference,
+		AuthorizationURL:  initResp.Data.AuthorizationURL,
+		AccessCode:        initResp.Data.AccessCode,
+		Amount:            order.AmountPaid,
+		Currency:          order.Currency,
+		PlatformFee:       order.PlatformFee,
+		OwnerPayoutAmount: order.OwnerPayoutAmount,
 	}, nil
 }
 
+func (s *Service) MarkOrderPaidByReference(reference string) error {
+	reference = strings.TrimSpace(reference)
+	if reference == "" {
+		return errors.New("reference is required")
+	}
+
+	client, err := s.paystackClient()
+	if err != nil {
+		return err
+	}
+
+	verifyResp, err := client.VerifyTransaction(reference)
+	if err != nil {
+		return err
+	}
+	if !verifyResp.Status || strings.ToLower(strings.TrimSpace(verifyResp.Data.Status)) != "success" {
+		return errors.New("payment not successful")
+	}
+
+	var completedOrder *models.DigitalOrder
+	var completionURL string
+
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		var order models.DigitalOrder
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("payment_reference = ?", reference).
+			Preload("DigitalProduct").
+			Preload("Business").
+			First(&order).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("order not found")
+			}
+			return err
+		}
+
+		if order.PaymentStatus == models.OrderPaymentStatusSuccessful {
+			completedOrder = &order
+			if order.AccessToken != nil {
+				completionURL = s.buildCompletionURL(order.ID, *order.AccessToken)
+			}
+			return nil
+		}
+
+		if order.AmountPaid != verifyResp.Data.Amount {
+			return fmt.Errorf("payment amount mismatch for order %s", order.ID.String())
+		}
+		if !strings.EqualFold(order.BuyerEmail, verifyResp.Data.Customer.Email) {
+			return fmt.Errorf("payment email mismatch for order %s", order.ID.String())
+		}
+		if order.Currency != "" && verifyResp.Data.Currency != "" && !strings.EqualFold(order.Currency, verifyResp.Data.Currency) {
+			return fmt.Errorf("payment currency mismatch for order %s", order.ID.String())
+		}
+
+		status, granted, accessURL, err := s.resolveFulfillment(&order.DigitalProduct)
+		if err != nil {
+			return err
+		}
+
+		now := time.Now()
+		var accessExpiry *time.Time
+		if order.DigitalProduct.AccessDurationHours != nil && *order.DigitalProduct.AccessDurationHours > 0 {
+			t := now.Add(time.Duration(*order.DigitalProduct.AccessDurationHours) * time.Hour)
+			accessExpiry = &t
+		}
+
+		accessToken := order.AccessToken
+		if accessToken == nil || strings.TrimSpace(*accessToken) == "" {
+			token := uuid.NewString()
+			accessToken = &token
+		}
+
+		updates := map[string]interface{}{
+			"payment_status":     models.OrderPaymentStatusSuccessful,
+			"paid_at":            now,
+			"payment_channel":    strings.TrimSpace(verifyResp.Data.Channel),
+			"fulfillment_status": status,
+			"access_granted":     granted,
+			"access_token":       *accessToken,
+			"access_expires_at":  accessExpiry,
+			"access_url":         accessURL,
+		}
+
+		if err := tx.Model(&models.DigitalOrder{}).
+			Where("id = ?", order.ID).
+			Updates(updates).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Model(&models.DigitalProduct{}).
+			Where("id = ?", order.DigitalProductID).
+			Updates(map[string]interface{}{
+				"sales_count":   gorm.Expr("sales_count + 1"),
+				"total_revenue": gorm.Expr("total_revenue + ?", order.AmountPaid),
+			}).Error; err != nil {
+			return err
+		}
+
+		order.PaymentStatus = models.OrderPaymentStatusSuccessful
+		order.PaidAt = &now
+		order.PaymentChannel = strings.TrimSpace(verifyResp.Data.Channel)
+		order.FulfillmentStatus = status
+		order.AccessGranted = granted
+		order.AccessToken = accessToken
+		order.AccessExpiresAt = accessExpiry
+		order.AccessURL = accessURL
+
+		completedOrder = &order
+		completionURL = s.buildCompletionURL(order.ID, *accessToken)
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if completedOrder == nil {
+		return errors.New("failed to finalize order")
+	}
+
+	email.SendDigitalProductAccess(
+		completedOrder.BuyerEmail,
+		completedOrder.BuyerName,
+		completedOrder.DigitalProduct.Title,
+		completedOrder.Business.Name,
+		completionURL,
+	)
+
+	_, _ = s.InitiatePayoutForOrder(completedOrder.ID)
+
+	return nil
+}
+
+func (s *Service) InitiatePayoutForOrder(orderID uuid.UUID) (*models.DigitalOrder, error) {
+	var updatedOrder *models.DigitalOrder
+
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		var order models.DigitalOrder
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", orderID).
+			Preload("DigitalProduct").
+			First(&order).Error; err != nil {
+			return errors.New("order not found")
+		}
+
+		if order.PaymentStatus != models.OrderPaymentStatusSuccessful {
+			return errors.New("order payment is not successful")
+		}
+
+		if order.OwnerPayoutAmount <= 0 {
+			return errors.New("owner payout amount must be greater than zero")
+		}
+
+		if order.PayoutStatus == models.PayoutStatusCompleted || order.PayoutStatus == models.PayoutStatusProcessing {
+			updatedOrder = &order
+			return nil
+		}
+
+		var payoutAcct models.BusinessPayoutAccount
+		if err := tx.
+			Where("business_id = ? AND is_default = ? AND is_verified = ?", order.BusinessID, true, true).
+			First(&payoutAcct).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				_ = tx.Model(&models.DigitalOrder{}).
+					Where("id = ?", order.ID).
+					Updates(map[string]interface{}{
+						"payout_status":      models.PayoutStatusPending,
+						"payout_fail_reason": "verified payout account not found",
+					}).Error
+				return nil
+			}
+			return err
+		}
+
+		if payoutAcct.PaystackRecipientCode == nil || strings.TrimSpace(*payoutAcct.PaystackRecipientCode) == "" {
+			_ = tx.Model(&models.DigitalOrder{}).
+				Where("id = ?", order.ID).
+				Updates(map[string]interface{}{
+					"payout_status":      models.PayoutStatusPending,
+					"payout_fail_reason": "paystack recipient code not found",
+				}).Error
+			return nil
+		}
+
+		client, err := s.paystackClient()
+		if err != nil {
+			return err
+		}
+
+		payoutReference := fmt.Sprintf("payout_%s", order.ID.String())
+		reason := fmt.Sprintf("Digital product payout for order %s", order.ID.String())
+
+		transferResp, err := client.InitiateTransfer(paystack.InitiateTransferRequest{
+			Source:    "balance",
+			Amount:    order.OwnerPayoutAmount,
+			Recipient: strings.TrimSpace(*payoutAcct.PaystackRecipientCode),
+			Reason:    reason,
+			Reference: payoutReference,
+		})
+		if err != nil {
+			attempts := order.PayoutAttempts + 1
+			failReason := err.Error()
+			if updateErr := tx.Model(&models.DigitalOrder{}).
+				Where("id = ?", order.ID).
+				Updates(map[string]interface{}{
+					"payout_status":      models.PayoutStatusFailed,
+					"payout_attempts":    attempts,
+					"payout_fail_reason": failReason,
+				}).Error; updateErr != nil {
+				return updateErr
+			}
+			return nil
+		}
+
+		attempts := order.PayoutAttempts + 1
+		ref := strings.TrimSpace(transferResp.Data.Reference)
+		if ref == "" {
+			ref = payoutReference
+		}
+
+		if err := tx.Model(&models.DigitalOrder{}).
+			Where("id = ?", order.ID).
+			Updates(map[string]interface{}{
+				"payout_status":      models.PayoutStatusProcessing,
+				"payout_reference":   ref,
+				"payout_attempts":    attempts,
+				"payout_fail_reason": nil,
+			}).Error; err != nil {
+			return err
+		}
+
+		order.PayoutStatus = models.PayoutStatusProcessing
+		order.PayoutReference = &ref
+		order.PayoutAttempts = attempts
+		order.PayoutFailReason = nil
+		updatedOrder = &order
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if updatedOrder == nil {
+		return nil, errors.New("failed to update payout state")
+	}
+
+	return updatedOrder, nil
+}
+
+func (s *Service) MarkPayoutSuccess(reference string) error {
+	reference = strings.TrimSpace(reference)
+	if reference == "" {
+		return errors.New("payout reference is required")
+	}
+
+	var owner ownerContact
+	var order models.DigitalOrder
+
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("payout_reference = ?", reference).
+			Preload("DigitalProduct").
+			Preload("Business").
+			First(&order).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("order not found for payout reference")
+			}
+			return err
+		}
+
+		if order.PayoutStatus == models.PayoutStatusCompleted {
+			return nil
+		}
+
+		now := time.Now()
+		if err := tx.Model(&models.DigitalOrder{}).
+			Where("id = ?", order.ID).
+			Updates(map[string]interface{}{
+				"payout_status":       models.PayoutStatusCompleted,
+				"payout_completed_at": now,
+				"payout_fail_reason":  nil,
+			}).Error; err != nil {
+			return err
+		}
+
+		order.PayoutStatus = models.PayoutStatusCompleted
+		order.PayoutCompletedAt = &now
+		order.PayoutFailReason = nil
+
+		ownerContactVal, err := s.getOwnerContactTx(tx, order.BusinessID)
+		if err == nil {
+			owner = *ownerContactVal
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(owner.Email) != "" {
+		email.SendPayoutNotification(
+			owner.Email,
+			owner.FirstName,
+			order.DigitalProduct.Title,
+			order.OwnerPayoutAmount,
+		)
+	}
+
+	return nil
+}
+
+func (s *Service) MarkPayoutFailed(reference string, reason string) error {
+	reference = strings.TrimSpace(reference)
+	reason = strings.TrimSpace(reason)
+	if reference == "" {
+		return errors.New("payout reference is required")
+	}
+	if reason == "" {
+		reason = "transfer failed"
+	}
+
+	var owner ownerContact
+	var order models.DigitalOrder
+
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("payout_reference = ?", reference).
+			Preload("DigitalProduct").
+			Preload("Business").
+			First(&order).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("order not found for payout reference")
+			}
+			return err
+		}
+
+		if err := tx.Model(&models.DigitalOrder{}).
+			Where("id = ?", order.ID).
+			Updates(map[string]interface{}{
+				"payout_status":      models.PayoutStatusFailed,
+				"payout_fail_reason": reason,
+			}).Error; err != nil {
+			return err
+		}
+
+		order.PayoutStatus = models.PayoutStatusFailed
+		order.PayoutFailReason = &reason
+
+		ownerContactVal, err := s.getOwnerContactTx(tx, order.BusinessID)
+		if err == nil {
+			owner = *ownerContactVal
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(owner.Email) != "" {
+		email.SendPayoutFailed(
+			owner.Email,
+			owner.FirstName,
+			order.DigitalProduct.Title,
+			order.OwnerPayoutAmount,
+			reason,
+		)
+	}
+
+	return nil
+}
+
 func (s *Service) GetFulfillment(orderID uuid.UUID, token string) (*FulfillmentResponse, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, errors.New("token is required")
+	}
+
 	var order models.DigitalOrder
 	if err := s.db.
 		Where("id = ? AND access_token = ?", orderID, token).
 		Preload("DigitalProduct").
 		First(&order).Error; err != nil {
-		return nil, errors.New("invalid order access")
+		return nil, errors.New("order not found or invalid token")
 	}
 
 	if order.PaymentStatus != models.OrderPaymentStatusSuccessful {
-		return nil, errors.New("payment not completed")
+		return nil, errors.New("payment has not been confirmed for this order")
 	}
 
 	if order.AccessExpiresAt != nil && time.Now().After(*order.AccessExpiresAt) {
-		return nil, errors.New("access has expired")
+		return nil, errors.New("access to this product has expired")
 	}
 
 	res := s.buildFulfillmentResponse(&order)
 	return &res, nil
 }
 
+func (s *Service) GetDownloadURLByToken(token string) (string, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", errors.New("download token is required")
+	}
+
+	var order models.DigitalOrder
+	if err := s.db.
+		Where("access_token = ?", token).
+		Preload("DigitalProduct").
+		First(&order).Error; err != nil {
+		return "", errors.New("invalid or expired download token")
+	}
+
+	if order.PaymentStatus != models.OrderPaymentStatusSuccessful {
+		return "", errors.New("payment has not been confirmed for this order")
+	}
+
+	if order.AccessExpiresAt != nil && time.Now().After(*order.AccessExpiresAt) {
+		return "", errors.New("download access has expired")
+	}
+
+	if order.DigitalProduct.FulfillmentMode != models.DigitalFulfillmentModeFileDownload {
+		return "", errors.New("this order does not include a file download")
+	}
+
+	if order.DigitalProduct.FileURL == nil || strings.TrimSpace(*order.DigitalProduct.FileURL) == "" {
+		return "", errors.New("file is not available for this product")
+	}
+
+	return *order.DigitalProduct.FileURL, nil
+}
+
 func (s *Service) GetDownloadURL(orderID uuid.UUID, buyerEmail string) (string, error) {
+	buyerEmail = strings.ToLower(strings.TrimSpace(buyerEmail))
+	if buyerEmail == "" {
+		return "", errors.New("email is required")
+	}
+
 	var order models.DigitalOrder
 	if err := s.db.
 		Where("id = ? AND buyer_email = ?", orderID, buyerEmail).
@@ -529,69 +1015,19 @@ func (s *Service) GetDownloadURL(orderID uuid.UUID, buyerEmail string) (string, 
 		return "", errors.New("order not found")
 	}
 
-	if order.DigitalProduct.FileURL == nil {
-		return "", errors.New("file not available")
-	}
-
-	return s.imagekitClient.GetSignedURL(imagekit.SignedURLOptions{
-		FilePath: *order.DigitalProduct.FileURL,
-		Expiry:   24 * time.Hour,
-	}), nil
-}
-
-func (s *Service) GetDownloadURLByToken(token string) (string, error) {
-	var order models.DigitalOrder
-	if err := s.db.
-		Where("access_token = ?", token).
-		Preload("DigitalProduct").
-		First(&order).Error; err != nil {
-		return "", errors.New("download access not found")
-	}
-
 	if order.PaymentStatus != models.OrderPaymentStatusSuccessful {
-		return "", errors.New("payment not completed")
-	}
-	if order.FulfillmentMode != models.DigitalFulfillmentModeFileDownload {
-		return "", errors.New("this product is not a file download")
-	}
-	if !order.AccessGranted || order.FulfillmentStatus != models.DigitalFulfillmentStatusReady {
-		return "", errors.New("download access is not ready")
-	}
-	if order.AccessExpiresAt != nil && time.Now().After(*order.AccessExpiresAt) {
-		return "", errors.New("download access has expired")
-	}
-	if order.DigitalProduct.FileURL == nil {
-		return "", errors.New("file not available")
-	}
-	if order.MaxDownloadCount != nil && order.DownloadCount >= *order.MaxDownloadCount {
-		return "", errors.New("download limit reached")
+		return "", errors.New("payment has not been confirmed for this order")
 	}
 
-	if err := s.db.Model(&models.DigitalOrder{}).
-		Where("id = ?", order.ID).
-		Update("download_count", gorm.Expr("download_count + 1")).Error; err != nil {
-		return "", err
+	if order.DigitalProduct.FulfillmentMode != models.DigitalFulfillmentModeFileDownload {
+		return "", errors.New("this order does not include a file download")
 	}
 
-	return s.imagekitClient.GetSignedURL(imagekit.SignedURLOptions{
-		FilePath: *order.DigitalProduct.FileURL,
-		Expiry:   24 * time.Hour,
-	}), nil
-}
-
-func (s *Service) buildPurchaseResult(order *models.DigitalOrder) *PurchaseResult {
-	var completionURL string
-	if order.AccessToken != nil {
-		completionURL = s.buildCompletionURL(order.ID, *order.AccessToken)
+	if order.DigitalProduct.FileURL == nil || strings.TrimSpace(*order.DigitalProduct.FileURL) == "" {
+		return "", errors.New("file is not available for this product")
 	}
 
-	return &PurchaseResult{
-		Message:       "Purchase already processed",
-		OrderID:       order.ID,
-		AccessToken:   order.AccessToken,
-		CompletionURL: completionURL,
-		Fulfillment:   s.buildFulfillmentResponse(order),
-	}
+	return *order.DigitalProduct.FileURL, nil
 }
 
 func (s *Service) buildFulfillmentResponse(order *models.DigitalOrder) FulfillmentResponse {
@@ -682,12 +1118,17 @@ func (s *Service) validateProductForPublishing(p *models.DigitalProduct) error {
 		if p.AccessRedirectURL == nil || strings.TrimSpace(*p.AccessRedirectURL) == "" {
 			return errors.New("cannot publish a course access product without an access_redirect_url")
 		}
+		if !isValidHTTPSURL(*p.AccessRedirectURL) {
+			return errors.New("access_redirect_url must be a valid https URL")
+		}
 	case models.DigitalFulfillmentModeExternalLink:
 		if p.AccessRedirectURL == nil || strings.TrimSpace(*p.AccessRedirectURL) == "" {
 			return errors.New("cannot publish an external link product without an access_redirect_url")
 		}
+		if !isValidHTTPSURL(*p.AccessRedirectURL) {
+			return errors.New("access_redirect_url must be a valid https URL")
+		}
 	case models.DigitalFulfillmentModeManualDelivery:
-		// valid
 	default:
 		return errors.New("invalid fulfillment mode")
 	}
@@ -723,12 +1164,72 @@ func (s *Service) validateFulfillmentMode(mode string) error {
 	}
 }
 
-func (s *Service) buildCompletionURL(orderID uuid.UUID, token string) string {
-	path := fmt.Sprintf("/public/orders/%s/complete?token=%s", orderID.String(), token)
-	if s.frontendURL == "" {
-		return path
+func (s *Service) buildDefaultCheckoutCallback(reference string) string {
+	u := fmt.Sprintf("%s/public/digital-store/payment/callback", strings.TrimRight(s.frontendURL, "/"))
+	if reference != "" {
+		u = u + "?reference=" + url.QueryEscape(reference)
 	}
-	return s.frontendURL + path
+	return u
+}
+
+func (s *Service) buildCompletionURL(orderID uuid.UUID, token string) string {
+	return fmt.Sprintf(
+		"%s/public/digital-orders/%s/complete?token=%s",
+		strings.TrimRight(s.frontendURL, "/"),
+		orderID.String(),
+		url.QueryEscape(token),
+	)
+}
+
+func (s *Service) generatePaymentReference() string {
+	return "dig_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+}
+
+func (s *Service) generateUniqueProductCode() string {
+	for {
+		code := "prd_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+
+		var count int64
+		if err := s.db.Model(&models.DigitalProduct{}).Where("slug = ?", code).Count(&count).Error; err != nil {
+			return code
+		}
+		if count == 0 {
+			return code
+		}
+	}
+}
+
+func (s *Service) paystackClient() (*paystack.Client, error) {
+	secret := strings.TrimSpace(os.Getenv("PAYSTACK_SECRET_KEY"))
+	if secret == "" {
+		return nil, errors.New("PAYSTACK_SECRET_KEY is not set")
+	}
+	return paystack.NewClient(secret), nil
+}
+
+func (s *Service) getOwnerContactTx(tx *gorm.DB, businessID uuid.UUID) (*ownerContact, error) {
+	var owner ownerContact
+
+	err := tx.
+		Table("business_users").
+		Select(`
+			users.id as user_id,
+			users.email as email,
+			COALESCE(users.first_name, 'there') as first_name
+		`).
+		Joins("JOIN users ON users.id = business_users.user_id").
+		Where("business_users.business_id = ? AND business_users.role = ? AND business_users.is_active = ?", businessID, "owner", true).
+		Limit(1).
+		Scan(&owner).Error
+	if err != nil {
+		return nil, err
+	}
+
+	if owner.UserID == uuid.Nil || strings.TrimSpace(owner.Email) == "" {
+		return nil, errors.New("active business owner email not found")
+	}
+
+	return &owner, nil
 }
 
 func parseGallery(raw string) []string {
@@ -751,18 +1252,10 @@ func marshalGallery(urls []string) string {
 	return string(b)
 }
 
-func (s *Service) generateSlug(title string) string {
-	slug := strings.Map(func(r rune) rune {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			return unicode.ToLower(r)
-		}
-		return '-'
-	}, title)
-
-	for strings.Contains(slug, "--") {
-		slug = strings.ReplaceAll(slug, "--", "-")
+func isValidHTTPSURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
 	}
-	slug = strings.Trim(slug, "-")
-
-	return fmt.Sprintf("%s-%d", slug, time.Now().UnixMilli())
+	return strings.EqualFold(u.Scheme, "https") && strings.TrimSpace(u.Host) != ""
 }

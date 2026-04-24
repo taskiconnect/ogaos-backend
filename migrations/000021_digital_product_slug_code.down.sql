@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_digital_products_slug_unique;

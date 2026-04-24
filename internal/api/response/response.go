@@ -2,22 +2,14 @@
 package response
 
 import (
+	"errors"
+	"log"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
-
-// Every endpoint returns one of these shapes:
-//
-//  Success (no data):     { "success": true,  "message": "..." }
-//  Success (with data):   { "success": true,  "data": {...}    }
-//  Cursor-paginated list: { "success": true,  "data": [...], "next_cursor": "..." | null }
-//  Error:                 { "success": false, "message": "..." }
-//
-// Cursor pagination:
-//   Client sends  ?cursor=<opaque>&limit=20
-//   Server returns next_cursor — null when no more pages exist.
-//   No total count (avoids COUNT(*) on every list request).
 
 func OK(c *gin.Context, data interface{}) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
@@ -31,13 +23,12 @@ func Message(c *gin.Context, msg string) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": msg})
 }
 
-// CursorList sends a cursor-paginated response.
-// nextCursor is "" when there are no more pages — serialised as JSON null.
 func CursorList(c *gin.Context, data interface{}, nextCursor string) {
 	var next interface{} = nextCursor
 	if nextCursor == "" {
 		next = nil
 	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"success":     true,
 		"data":        data,
@@ -66,15 +57,59 @@ func InternalError(c *gin.Context, msg string) {
 }
 
 func Err(c *gin.Context, err error) {
-	msg := err.Error()
-	switch msg {
-	case "record not found", "not found":
+	if err == nil {
+		InternalError(c, "something went wrong")
+		return
+	}
+
+	log.Printf("[API_ERROR] %s %s: %v", c.Request.Method, c.Request.URL.Path, err)
+
+	msg := strings.TrimSpace(err.Error())
+	lowerMsg := strings.ToLower(msg)
+
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		NotFound(c, "record not found")
+
+	case msg == "record not found" || msg == "not found":
 		NotFound(c, msg)
-	case "unauthorized", "authentication required":
+
+	case msg == "unauthorized" || msg == "authentication required":
 		Unauthorized(c, msg)
-	case "forbidden", "access denied":
+
+	case msg == "forbidden" || msg == "access denied":
 		Forbidden(c, msg)
+
+	case isDatabaseError(lowerMsg):
+		InternalError(c, "something went wrong, please try again later")
+
 	default:
 		BadRequest(c, msg)
 	}
+}
+
+func isDatabaseError(msg string) bool {
+	dbErrorMarkers := []string{
+		"sqlstate",
+		"relation",
+		"duplicate key",
+		"violates foreign key constraint",
+		"violates unique constraint",
+		"violates not-null constraint",
+		"pq:",
+		"syntax error at or near",
+		"database",
+		"deadlock",
+		"connection refused",
+		"connection reset",
+		"no rows in result set",
+	}
+
+	for _, marker := range dbErrorMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+
+	return false
 }

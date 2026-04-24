@@ -263,20 +263,8 @@ func (h *Handler) RemoveGalleryImage(c *gin.Context) {
 	response.OK(c, p)
 }
 
-// ─── Public ───────────────────────────────────────────────────────────────────
-
-// GET /public/store/:slug
-func (h *Handler) GetPublicProduct(c *gin.Context) {
-	p, err := h.service.GetPublic(c.Param("slug"))
-	if err != nil {
-		response.NotFound(c, err.Error())
-		return
-	}
-	response.OK(c, p)
-}
-
-// GET /public/business/:slug/products
-func (h *Handler) ListPublicProducts(c *gin.Context) {
+// GET /public/digital-store/:slug
+func (h *Handler) ListPublicStore(c *gin.Context) {
 	products, err := h.service.ListPublic(c.Param("slug"))
 	if err != nil {
 		response.NotFound(c, err.Error())
@@ -285,20 +273,30 @@ func (h *Handler) ListPublicProducts(c *gin.Context) {
 	response.OK(c, products)
 }
 
-// POST /public/store/:id/purchase
-func (h *Handler) Purchase(c *gin.Context) {
+// GET /public/digital-store/product/:slug
+func (h *Handler) GetPublicStoreProduct(c *gin.Context) {
+	p, err := h.service.GetPublic(c.Param("slug"))
+	if err != nil {
+		response.NotFound(c, err.Error())
+		return
+	}
+	response.OK(c, p)
+}
+
+// POST /public/digital-store/:id/initialize-payment
+func (h *Handler) InitializePayment(c *gin.Context) {
 	id, ok := shared.ParseID(c, "id")
 	if !ok {
 		return
 	}
 
-	var req svcDigital.PurchaseRequest
+	var req svcDigital.InitializeCheckoutRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
 
-	result, err := h.service.CompletePurchase(id, req)
+	result, err := h.service.InitializePublicCheckout(id, req)
 	if err != nil {
 		response.Err(c, err)
 		return
@@ -307,7 +305,7 @@ func (h *Handler) Purchase(c *gin.Context) {
 	response.Created(c, result)
 }
 
-// GET /public/orders/:order_id/fulfillment?token=...
+// GET /public/digital-orders/:order_id/fulfillment?token=...
 func (h *Handler) GetFulfillment(c *gin.Context) {
 	orderID, ok := shared.ParseID(c, "order_id")
 	if !ok {
@@ -329,7 +327,7 @@ func (h *Handler) GetFulfillment(c *gin.Context) {
 	response.OK(c, result)
 }
 
-// GET /public/downloads/:token
+// GET /public/digital-downloads/:token
 func (h *Handler) DownloadByToken(c *gin.Context) {
 	token := c.Param("token")
 	if token == "" {
@@ -367,4 +365,12 @@ func (h *Handler) GetDownload(c *gin.Context) {
 	}
 
 	response.OK(c, gin.H{"download_url": url})
+}
+
+func (h *Handler) GetPublicProduct(c *gin.Context) {
+	h.GetPublicStoreProduct(c)
+}
+
+func (h *Handler) ListPublicProducts(c *gin.Context) {
+	h.ListPublicStore(c)
 }

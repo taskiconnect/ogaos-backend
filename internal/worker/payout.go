@@ -4,6 +4,7 @@ package worker
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -15,11 +16,9 @@ import (
 
 const (
 	maxPayoutAttempts = 3
-	payoutCooldown    = 24 * time.Hour // wait 24 h between retries
+	payoutCooldown    = 24 * time.Hour
 )
 
-// PayoutWorker processes pending digital order payouts.
-// Run once daily (or more frequently) via a cron job or ticker.
 type PayoutWorker struct {
 	db             *gorm.DB
 	paystackClient *pkgPaystack.Client
@@ -29,7 +28,6 @@ func NewPayoutWorker(db *gorm.DB, paystackClient *pkgPaystack.Client) *PayoutWor
 	return &PayoutWorker{db: db, paystackClient: paystackClient}
 }
 
-// Run processes all pending and retryable payouts.
 func (w *PayoutWorker) Run() {
 	log.Println("[PAYOUT] Starting payout run")
 
@@ -39,7 +37,8 @@ func (w *PayoutWorker) Run() {
 			[]string{models.PayoutStatusPending, models.PayoutStatusFailed},
 			maxPayoutAttempts,
 		).
-		Where("created_at < ?", time.Now().Add(-10*time.Minute)). // 10-min settle buffer
+		Where("payment_status = ?", models.OrderPaymentStatusSuccessful).
+		Where("created_at < ?", time.Now().Add(-10*time.Minute)).
 		Preload("DigitalProduct").
 		Preload("Business").
 		Find(&orders)
@@ -56,28 +55,35 @@ func (w *PayoutWorker) Run() {
 }
 
 func (w *PayoutWorker) processOrder(order models.DigitalOrder) error {
-	// Find default payout account for the business
+	if order.PaymentStatus != models.OrderPaymentStatusSuccessful {
+		return fmt.Errorf("order %s payment is not successful", order.ID)
+	}
+
+	if order.OwnerPayoutAmount <= 0 {
+		return fmt.Errorf("order %s owner payout amount is invalid", order.ID)
+	}
+
 	var payoutAccount models.BusinessPayoutAccount
-	if err := w.db.Where("business_id = ? AND is_default = true AND is_verified = true", order.BusinessID).
+	if err := w.db.
+		Where("business_id = ? AND is_default = true AND is_verified = true", order.BusinessID).
 		First(&payoutAccount).Error; err != nil {
 		return w.failOrder(order, "no verified default payout account found")
 	}
 
-	if payoutAccount.PaystackRecipientCode == nil {
+	if payoutAccount.PaystackRecipientCode == nil || strings.TrimSpace(*payoutAccount.PaystackRecipientCode) == "" {
 		return w.failOrder(order, "payout account has no Paystack recipient code")
 	}
 
-	// Mark as processing to prevent double-dispatch
 	w.db.Model(&order).Updates(map[string]interface{}{
 		"payout_status":   models.PayoutStatusProcessing,
 		"payout_attempts": gorm.Expr("payout_attempts + 1"),
 	})
 
-	ref := fmt.Sprintf("payout-%s", order.ID)
+	ref := fmt.Sprintf("payout-%s", order.ID.String())
 	resp, err := w.paystackClient.InitiateTransfer(pkgPaystack.InitiateTransferRequest{
 		Source:    "balance",
 		Amount:    order.OwnerPayoutAmount,
-		Recipient: *payoutAccount.PaystackRecipientCode,
+		Recipient: strings.TrimSpace(*payoutAccount.PaystackRecipientCode),
 		Reason:    fmt.Sprintf("Payout for %s", order.DigitalProduct.Title),
 		Reference: ref,
 	})
@@ -85,59 +91,81 @@ func (w *PayoutWorker) processOrder(order models.DigitalOrder) error {
 		return w.failOrder(order, err.Error())
 	}
 
-	// Paystack transfer is async — final status arrives via webhook
-	// Mark as processing with the transfer reference so the webhook handler can reconcile
+	transferRef := strings.TrimSpace(resp.Data.TransferCode)
+	if transferRef == "" {
+		transferRef = strings.TrimSpace(resp.Data.Reference)
+	}
+	if transferRef == "" {
+		transferRef = ref
+	}
+
 	w.db.Model(&order).Updates(map[string]interface{}{
 		"payout_status":    models.PayoutStatusProcessing,
-		"payout_reference": resp.Data.TransferCode,
+		"payout_reference": transferRef,
 	})
 
-	log.Printf("[PAYOUT] Order %s: transfer initiated ref=%s", order.ID, resp.Data.TransferCode)
+	log.Printf("[PAYOUT] Order %s: transfer initiated ref=%s", order.ID, transferRef)
 	return nil
 }
 
-// MarkPayoutComplete is called by the webhook handler when transfer.success fires.
 func (w *PayoutWorker) MarkPayoutComplete(transferCode string) {
 	now := time.Now()
+
 	result := w.db.Model(&models.DigitalOrder{}).
 		Where("payout_reference = ?", transferCode).
 		Updates(map[string]interface{}{
 			"payout_status":       models.PayoutStatusCompleted,
 			"payout_completed_at": now,
+			"payout_fail_reason":  nil,
 		})
 	if result.RowsAffected == 0 {
 		log.Printf("[PAYOUT] MarkPayoutComplete: no order found for transfer_code=%s", transferCode)
 		return
 	}
 
-	// Notify business owner
 	var order models.DigitalOrder
-	if err := w.db.Where("payout_reference = ?", transferCode).
+	if err := w.db.
+		Where("payout_reference = ?", transferCode).
 		Preload("DigitalProduct").
 		Preload("Business").
 		First(&order).Error; err != nil {
 		return
 	}
+
 	var bu models.BusinessUser
-	if err := w.db.Where("business_id = ? AND role = 'owner'", order.BusinessID).First(&bu).Error; err != nil {
+	if err := w.db.
+		Where("business_id = ? AND role = ? AND is_active = ?", order.BusinessID, "owner", true).
+		First(&bu).Error; err != nil {
 		return
 	}
+
 	var owner models.User
 	if err := w.db.First(&owner, bu.UserID).Error; err != nil {
 		return
 	}
+
+	name := strings.TrimSpace(owner.FirstName + " " + owner.LastName)
+	if name == "" {
+		name = owner.FirstName
+	}
+
 	email.SendPayoutNotification(
 		owner.Email,
-		owner.FirstName+" "+owner.LastName,
+		name,
 		order.DigitalProduct.Title,
 		order.OwnerPayoutAmount,
 	)
 }
 
-// MarkPayoutFailed is called by the webhook handler when transfer.failed / transfer.reversed fires.
 func (w *PayoutWorker) MarkPayoutFailed(transferCode, reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "transfer failed"
+	}
+
 	var order models.DigitalOrder
-	if err := w.db.Where("payout_reference = ?", transferCode).
+	if err := w.db.
+		Where("payout_reference = ?", transferCode).
 		Preload("DigitalProduct").
 		Preload("Business").
 		First(&order).Error; err != nil {
@@ -150,14 +178,22 @@ func (w *PayoutWorker) MarkPayoutFailed(transferCode, reason string) {
 		"payout_fail_reason": reason,
 	}
 
-	// If max attempts reached, give up — notify owner
 	if order.PayoutAttempts >= maxPayoutAttempts {
 		updates["payout_status"] = "exhausted"
 		w.notifyPayoutFailed(order, reason)
 	}
-	// Otherwise leave as failed — Run() will retry on next cycle
 
 	w.db.Model(&order).Updates(updates)
+}
+
+func (w *PayoutWorker) HandleTransferSuccess(reference string) error {
+	w.MarkPayoutComplete(reference)
+	return nil
+}
+
+func (w *PayoutWorker) HandleTransferFailed(reference string, reason string) error {
+	w.MarkPayoutFailed(reference, reason)
+	return nil
 }
 
 func (w *PayoutWorker) failOrder(order models.DigitalOrder, reason string) error {
@@ -166,26 +202,37 @@ func (w *PayoutWorker) failOrder(order models.DigitalOrder, reason string) error
 		"payout_fail_reason": reason,
 		"payout_attempts":    gorm.Expr("payout_attempts + 1"),
 	}
+
 	if order.PayoutAttempts+1 >= maxPayoutAttempts {
 		updates["payout_status"] = "exhausted"
 		w.notifyPayoutFailed(order, reason)
 	}
+
 	w.db.Model(&order).Updates(updates)
 	return fmt.Errorf("payout failed for order %s: %s", order.ID, reason)
 }
 
 func (w *PayoutWorker) notifyPayoutFailed(order models.DigitalOrder, reason string) {
 	var bu models.BusinessUser
-	if err := w.db.Where("business_id = ? AND role = 'owner'", order.BusinessID).First(&bu).Error; err != nil {
+	if err := w.db.
+		Where("business_id = ? AND role = ? AND is_active = ?", order.BusinessID, "owner", true).
+		First(&bu).Error; err != nil {
 		return
 	}
+
 	var owner models.User
 	if err := w.db.First(&owner, bu.UserID).Error; err != nil {
 		return
 	}
+
+	name := strings.TrimSpace(owner.FirstName + " " + owner.LastName)
+	if name == "" {
+		name = owner.FirstName
+	}
+
 	email.SendPayoutFailed(
 		owner.Email,
-		owner.FirstName+" "+owner.LastName,
+		name,
 		order.DigitalProduct.Title,
 		order.OwnerPayoutAmount,
 		reason,

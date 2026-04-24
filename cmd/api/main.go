@@ -22,6 +22,7 @@ import (
 	handlerHealth "ogaos-backend/internal/api/handlers/health"
 	handlerInvoice "ogaos-backend/internal/api/handlers/invoice"
 	handlerLocation "ogaos-backend/internal/api/handlers/location"
+	handlerPayout "ogaos-backend/internal/api/handlers/payout"
 	handlerProduct "ogaos-backend/internal/api/handlers/product"
 	handlerPublic "ogaos-backend/internal/api/handlers/public"
 	handlerRecruitment "ogaos-backend/internal/api/handlers/recruitment"
@@ -48,6 +49,7 @@ import (
 	svcExpense "ogaos-backend/internal/service/expense"
 	svcInvoice "ogaos-backend/internal/service/invoice"
 	svcLocation "ogaos-backend/internal/service/location"
+	svcPayout "ogaos-backend/internal/service/payout"
 	svcProduct "ogaos-backend/internal/service/product"
 	svcPublic "ogaos-backend/internal/service/public"
 	svcRecruitment "ogaos-backend/internal/service/recruitment"
@@ -128,6 +130,7 @@ func main() {
 	digitalSvc := svcDigital.NewService(db.DB, ikClient, cfg.FrontendURL, cfg.PlatformFeePercent)
 	couponService := svcCoupon.NewService(db.DB)
 	subscriptionSvc := svcSubscription.NewService(db.DB, cfg.FrontendURL, couponService)
+	payoutSvc := svcPayout.NewService(db.DB)
 	uploadSvc := svcUpload.NewService(ikClient)
 
 	scheduler := worker.NewScheduler(db.DB, paystackClient)
@@ -155,6 +158,7 @@ func main() {
 	recruitmentHandler := handlerRecruitment.NewHandler(recruitmentSvc, uploadSvc)
 	digitalHandler := handlerDigital.NewHandler(digitalSvc, uploadSvc)
 	couponHandler := handlerCoupon.NewHandler(couponService, logger)
+	payoutHandler := handlerPayout.NewHandler(payoutSvc)
 
 	subscriptionHandler := handlerSubscription.NewHandler(
 		subscriptionSvc,
@@ -212,6 +216,7 @@ func main() {
 		subscriptionHandler,
 		adminAuthHandler,
 		publicHandler,
+		payoutHandler,
 	)
 
 	srv := &http.Server{

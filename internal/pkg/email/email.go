@@ -409,6 +409,35 @@ func SendAdminPasswordSetupEmail(to, firstName, token, frontendURL string) {
 	}
 }
 
+// SendBusinessPayoutOTP sends the payout-account verification code to the business owner's email.
+func SendBusinessPayoutOTP(to, firstName, otpCode, bankName, accountNumber string) {
+	masked := accountNumber
+	if len(masked) > 4 {
+		masked = strings.Repeat("*", len(masked)-4) + masked[len(masked)-4:]
+	}
+
+	subject := "Verify your payout account on OgaOs"
+	html := fmt.Sprintf(`
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2>Payout Account Verification</h2>
+            <p>Hi %s,</p>
+            <p>You're trying to add or update your payout account on OgaOs.</p>
+            <p><strong>Bank:</strong> %s</p>
+            <p><strong>Account:</strong> %s</p>
+            <p>Use the OTP below to confirm this action:</p>
+            <div style="background-color: #f3f4f6; padding: 20px; text-align: center; font-size: 32px; letter-spacing: 5px; font-weight: bold; border-radius: 8px; margin: 20px 0;">
+                %s
+            </div>
+            <p>This code will expire in <strong>5 minutes</strong>.</p>
+            <p>If you did not request this, please log in to your OgaOs dashboard and review your account activity.</p>
+        </div>
+    `, firstName, bankName, masked, otpCode)
+
+	if err := send(to, subject, html); err != nil {
+		log.Printf("[EMAIL ERROR] SendBusinessPayoutOTP to %s: %v", to, err)
+	}
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 func formatKobo(kobo int64) string {
